@@ -1,0 +1,29 @@
+# Local configuration
+config.yml
+config.yaml
+.env
+.env.*
+!.env.example
+
+# Build outputs
+/proxy-acp-codex
+/codex-cli-acp
+bin/
+dist/
+build/
+*.test
+*.out
+coverage.out
+
+# Go workspace and caches
+go.work
+go.work.sum
+
+# Logs and runtime files
+*.log
+*.pid
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
