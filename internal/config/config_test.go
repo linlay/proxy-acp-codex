@@ -42,6 +42,10 @@ func TestLoadAppliesEnvOverrides(t *testing.T) {
 	t.Setenv("CODEX_CLI", "/opt/bin/codex")
 	t.Setenv("CODEX_ARGS", `--permission-mode dontAsk --label "hello world"`)
 	t.Setenv("PROXY_ACP_IDLE_TIMEOUT_MS", "42")
+	t.Setenv("http_proxy", "http://127.0.0.1:8001")
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:8001")
+	t.Setenv("https_proxy", "http://127.0.0.1:8001")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:8001")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -70,6 +74,11 @@ func TestLoadAppliesEnvOverrides(t *testing.T) {
 	if backend.IdleTimeoutMs != 42 {
 		t.Fatalf("idle timeout = %d", backend.IdleTimeoutMs)
 	}
+	for _, key := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"} {
+		if got := backend.Env[key]; got != "http://127.0.0.1:8001" {
+			t.Fatalf("backend env %s = %q", key, got)
+		}
+	}
 }
 
 func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
@@ -83,6 +92,7 @@ func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
 		"CODEX_CLI=/file/codex",
 		"CODEX_ARGS=\"--permission-mode dontAsk\"",
 		"PROXY_ACP_IDLE_TIMEOUT_MS=99",
+		"HTTP_PROXY=http://127.0.0.1:8001",
 		"",
 	}, "\n")), 0o600); err != nil {
 		t.Fatalf("write dotenv: %v", err)
@@ -112,6 +122,9 @@ func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
 	}
 	if cfg.Backends[0].IdleTimeoutMs != 99 {
 		t.Fatalf("idle timeout = %d", cfg.Backends[0].IdleTimeoutMs)
+	}
+	if got := cfg.Backends[0].Env["HTTP_PROXY"]; got != "http://127.0.0.1:8001" {
+		t.Fatalf("backend HTTP_PROXY = %q", got)
 	}
 }
 
@@ -172,6 +185,10 @@ func withCleanEnv(t *testing.T) {
 		"CODEX_CLI",
 		"CODEX_ARGS",
 		"PROXY_ACP_IDLE_TIMEOUT_MS",
+		"http_proxy",
+		"HTTP_PROXY",
+		"https_proxy",
+		"HTTPS_PROXY",
 	} {
 		value, ok := os.LookupEnv(key)
 		if err := os.Unsetenv(key); err != nil {

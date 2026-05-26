@@ -75,6 +75,10 @@ func Load(path string) (Config, error) {
 		"CODEX_CLI",
 		"CODEX_ARGS",
 		"PROXY_ACP_IDLE_TIMEOUT_MS",
+		"http_proxy",
+		"HTTP_PROXY",
+		"https_proxy",
+		"HTTPS_PROXY",
 	} {
 		if value, ok := os.LookupEnv(key); ok {
 			values[key] = value
@@ -120,6 +124,7 @@ func fromEnv(values map[string]string) (Config, error) {
 		}
 		idleTimeoutMs = parsed
 	}
+	backendEnv := proxyEnv(values)
 
 	cfg := Config{
 		ListenAddr:     net.JoinHostPort(addr, port),
@@ -129,10 +134,21 @@ func fromEnv(values map[string]string) (Config, error) {
 			Key:           DefaultCodexBackendKey,
 			Command:       SelfBackendCommand,
 			Args:          backendArgs,
+			Env:           backendEnv,
 			IdleTimeoutMs: idleTimeoutMs,
 		}},
 	}
 	return cfg, nil
+}
+
+func proxyEnv(values map[string]string) map[string]string {
+	env := map[string]string{}
+	for _, key := range []string{"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"} {
+		if value := strings.TrimSpace(values[key]); value != "" {
+			env[key] = value
+		}
+	}
+	return env
 }
 
 func (c *Config) Normalize() error {
