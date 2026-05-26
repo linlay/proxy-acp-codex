@@ -10,11 +10,11 @@ Core capabilities:
 
 - Expose platform-compatible HTTP/SSE endpoints.
 - Expose a WebSocket endpoint for platform PROXY frames.
-- Run an internal ACP backend mode for the host Codex CLI from the same `proxy-acp-codex` binary.
+- Run an internal ACP backend mode for the host Codex CLI app-server from the same `proxy-acp-codex` binary.
 - Start and reuse ACP stdio backend sessions by backend, chat, and working directory.
 - Forward cancellation requests to ACP sessions; generic platform HITL forwarding remains available for backends that request ACP permissions.
 
-This repository supports Codex CLI through `codex exec --json`.
+This repository defaults to Codex CLI app-server through `codex app-server --listen stdio://` for true streaming. The legacy `codex exec --json` adapter remains available with `CODEX_BACKEND=exec-json`.
 
 ## 2. Tech Stack
 
@@ -40,7 +40,7 @@ The service is split into three main layers:
 Request flow:
 
 ```text
-platform client -> internal/server -> internal/acpbridge -> proxy-acp-codex hidden ACP mode -> Codex CLI
+platform client -> internal/server -> internal/acpbridge -> proxy-acp-codex hidden ACP mode -> Codex CLI app-server
 ```
 
 Backend sessions are keyed by backend key, chat id, and working directory. Active runs are tracked separately so interrupt requests can find the session currently handling a run.
@@ -142,8 +142,10 @@ make clean
 - The repository does not currently define Docker or Kubernetes deployment assets.
 - Codex CLI must be installed separately and available to the service process.
 - `CODEX_CLI` configures the host Codex CLI command or absolute path.
-- `CODEX_ARGS` configures extra `codex exec` arguments using shell-style splitting.
+- `CODEX_BACKEND` defaults to `app-server`; `exec-json` is legacy fallback.
+- `CODEX_APP_SERVER_ARGS` configures extra `codex app-server` arguments using shell-style splitting.
+- `CODEX_ARGS` configures extra `codex exec` arguments only when `CODEX_BACKEND=exec-json`.
 - `PROXY_ACP_ADDR` defaults to local-only `127.0.0.1`; remote access requires an explicit value such as `0.0.0.0`.
 - Backend processes inherit the service environment.
-- Codex defaults to ACP file read only. Codex owns its normal CLI approval and sandbox behavior inside `codex exec`.
+- Codex defaults to ACP file read only. Codex owns its normal approval and sandbox behavior inside app-server.
 - WebSocket origin checks currently allow all origins.

@@ -26,7 +26,7 @@ func TestLoadDefaultsToLocalCodexBackend(t *testing.T) {
 	if backend.Command != SelfBackendCommand {
 		t.Fatalf("backend command = %q", backend.Command)
 	}
-	if got, want := backend.Args, []string{CodexBackendModeArg, "-codex", "codex"}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+	if got, want := backend.Args, []string{CodexBackendModeArg, "-backend", "app-server", "-codex", "codex"}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
 	if !backend.Capabilities.ReadTextFile() || backend.Capabilities.WriteTextFile() || backend.Capabilities.TerminalEnabled() {
@@ -40,7 +40,7 @@ func TestLoadAppliesEnvOverrides(t *testing.T) {
 	t.Setenv("PROXY_ACP_ADDR", "0.0.0.0")
 	t.Setenv("PROXY_ACP_AUTH_TOKEN", "secret")
 	t.Setenv("CODEX_CLI", "/opt/bin/codex")
-	t.Setenv("CODEX_ARGS", `--permission-mode dontAsk --label "hello world"`)
+	t.Setenv("CODEX_APP_SERVER_ARGS", `--enable network_proxy -c "model=gpt-5"`)
 	t.Setenv("PROXY_ACP_IDLE_TIMEOUT_MS", "42")
 	t.Setenv("http_proxy", "http://127.0.0.1:8001")
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:8001")
@@ -63,11 +63,12 @@ func TestLoadAppliesEnvOverrides(t *testing.T) {
 	}
 	if got, want := backend.Args, []string{
 		CodexBackendModeArg,
+		"-backend", "app-server",
 		"-codex", "/opt/bin/codex",
-		"-arg", "--permission-mode",
-		"-arg", "dontAsk",
-		"-arg", "--label",
-		"-arg", "hello world",
+		"-app-server-arg", "--enable",
+		"-app-server-arg", "network_proxy",
+		"-app-server-arg", "-c",
+		"-app-server-arg", "model=gpt-5",
 	}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -90,7 +91,7 @@ func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
 		"PROXY_ACP_ADDR=0.0.0.0",
 		"PROXY_ACP_AUTH_TOKEN=from_file",
 		"CODEX_CLI=/file/codex",
-		"CODEX_ARGS=\"--permission-mode dontAsk\"",
+		"CODEX_APP_SERVER_ARGS=\"--enable network_proxy\"",
 		"PROXY_ACP_IDLE_TIMEOUT_MS=99",
 		"HTTP_PROXY=http://127.0.0.1:8001",
 		"",
@@ -99,7 +100,7 @@ func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
 	}
 	t.Setenv("PROXY_ACP_AUTH_TOKEN", "from_env")
 	t.Setenv("CODEX_CLI", "/env/codex")
-	t.Setenv("CODEX_ARGS", "--permission-mode plan")
+	t.Setenv("CODEX_APP_SERVER_ARGS", "--enable network_proxy -c model=gpt-5")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -114,10 +115,10 @@ func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
 	if got := cfg.Backends[0].Command; got != SelfBackendCommand {
 		t.Fatalf("codex cli acp = %q", got)
 	}
-	if got := cfg.Backends[0].Args[2]; got != "/env/codex" {
+	if got := cfg.Backends[0].Args[4]; got != "/env/codex" {
 		t.Fatalf("codex cli = %q", got)
 	}
-	if got, want := cfg.Backends[0].Args[3:], []string{"-arg", "--permission-mode", "-arg", "plan"}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+	if got, want := cfg.Backends[0].Args[5:], []string{"-app-server-arg", "--enable", "-app-server-arg", "network_proxy", "-app-server-arg", "-c", "-app-server-arg", "model=gpt-5"}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("extra args = %#v, want %#v", got, want)
 	}
 	if cfg.Backends[0].IdleTimeoutMs != 99 {
@@ -128,12 +129,34 @@ func TestLoadDotenvAndProcessEnvPrecedence(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidCodexArgs(t *testing.T) {
+func TestLoadRejectsInvalidAppServerArgs(t *testing.T) {
 	withCleanEnv(t)
-	t.Setenv("CODEX_ARGS", `"unterminated`)
+	t.Setenv("CODEX_APP_SERVER_ARGS", `"unterminated`)
 	_, err := Load("")
-	if err == nil || !strings.Contains(err.Error(), "CODEX_ARGS") {
-		t.Fatalf("error = %v, want CODEX_ARGS error", err)
+	if err == nil || !strings.Contains(err.Error(), "CODEX_APP_SERVER_ARGS") {
+		t.Fatalf("error = %v, want CODEX_APP_SERVER_ARGS error", err)
+	}
+}
+
+func TestLoadExecJSONBackendUsesCodexArgs(t *testing.T) {
+	withCleanEnv(t)
+	t.Setenv("CODEX_BACKEND", "exec-json")
+	t.Setenv("CODEX_ARGS", `--permission-mode dontAsk --label "hello world"`)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got, want := cfg.Backends[0].Args, []string{
+		CodexBackendModeArg,
+		"-backend", "exec-json",
+		"-codex", "codex",
+		"-arg", "--permission-mode",
+		"-arg", "dontAsk",
+		"-arg", "--label",
+		"-arg", "hello world",
+	}; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
 	}
 }
 
@@ -183,7 +206,9 @@ func withCleanEnv(t *testing.T) {
 		"PROXY_ACP_ADDR",
 		"PROXY_ACP_AUTH_TOKEN",
 		"CODEX_CLI",
+		"CODEX_BACKEND",
 		"CODEX_ARGS",
+		"CODEX_APP_SERVER_ARGS",
 		"PROXY_ACP_IDLE_TIMEOUT_MS",
 		"http_proxy",
 		"HTTP_PROXY",

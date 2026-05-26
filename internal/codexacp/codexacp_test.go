@@ -1,14 +1,18 @@
 package codexacp
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -160,6 +164,255 @@ func TestRunCodexCapturesThreadIDAndSupportsResumeArgs(t *testing.T) {
 	if !reflect.DeepEqual(lines, want) {
 		t.Fatalf("argv log = %#v, want %#v", lines, want)
 	}
+}
+
+func TestAppServerSessionStreamsDeltasAndSuppressesCompletedDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	fakeCodex := writeAppServerHelper(t, dir)
+	peer := &fakePeer{}
+
+	session, err := startAppServerSession(context.Background(), fakeCodex, []string{"--fake-flag"}, dir, acp.SessionId("sess_test"), peer)
+	if err != nil {
+		t.Fatalf("start app-server session: %v", err)
+	}
+	defer session.close()
+
+	stop, err := session.prompt(context.Background(), "say hello")
+	if err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	if stop != acp.StopReasonEndTurn {
+		t.Fatalf("stop = %q", stop)
+	}
+	if got, want := peer.messages, []string{"he", "llo"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("messages = %#v, want %#v", got, want)
+	}
+	if got, want := peer.thoughts, []string{"thinking"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thoughts = %#v, want %#v", got, want)
+	}
+}
+
+func TestAppServerCompletedItemFallback(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"agentMessage","id":"item_1","text":"fallback"}}`))
+	if got, want := peer.messages, []string{"fallback"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("messages = %#v, want %#v", got, want)
+	}
+
+	peer = &fakePeer{}
+	session = &appServerSession{sessionID: "sess_test", conn: peer, seenMessageDelta: map[string]bool{"item_1": true}}
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"agentMessage","id":"item_1","text":"duplicate"}}`))
+	if len(peer.messages) != 0 {
+		t.Fatalf("messages = %#v, want no duplicate", peer.messages)
+	}
+}
+
+func TestAppServerCancelSendsInterrupt(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "methods.log")
+	fakeCodex := writeAppServerHelper(t, dir)
+	t.Setenv("FAKE_APP_SERVER_SCENARIO", "wait")
+	t.Setenv("FAKE_APP_SERVER_LOG", logPath)
+	peer := &fakePeer{}
+
+	session, err := startAppServerSession(context.Background(), fakeCodex, nil, dir, acp.SessionId("sess_test"), peer)
+	if err != nil {
+		t.Fatalf("start app-server session: %v", err)
+	}
+	defer session.close()
+
+	result := make(chan appTurnResult, 1)
+	go func() {
+		stop, err := session.prompt(context.Background(), "wait")
+		result <- appTurnResult{stop: stop, err: err}
+	}()
+	waitForActiveTurn(t, session)
+	if err := session.cancel(context.Background()); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("prompt err = %v", got.err)
+	}
+	if got.stop != acp.StopReasonCancelled {
+		t.Fatalf("stop = %q", got.stop)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(data), "turn/interrupt") {
+		t.Fatalf("methods log = %q, want turn/interrupt", data)
+	}
+}
+
+func TestAppServerCommandApprovalMapsToACPPermission(t *testing.T) {
+	peer := &fakePeer{permissionResponse: selectedPermission("acceptForSession")}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	result, err := session.handleCommandApproval([]byte(`{"itemId":"cmd_1","command":"go test ./...","availableDecisions":["accept","acceptForSession","decline"]}`))
+	if err != nil {
+		t.Fatalf("approval: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok || payload["decision"] != "acceptForSession" {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(peer.permissionRequests) != 1 {
+		t.Fatalf("permission requests = %#v", peer.permissionRequests)
+	}
+	req := peer.permissionRequests[0]
+	if req.ToolCall.ToolCallId != "cmd_1" {
+		t.Fatalf("tool call id = %q", req.ToolCall.ToolCallId)
+	}
+	if got := len(req.Options); got != 3 {
+		t.Fatalf("options len = %d", got)
+	}
+}
+
+func TestAppServerPermissionsApprovalRejectsToEmptyProfile(t *testing.T) {
+	peer := &fakePeer{permissionResponse: acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	result, err := session.handlePermissionsApproval([]byte(`{"itemId":"perm_1","reason":"needs network","permissions":{"network":{"enabled":true},"fileSystem":null}}`))
+	if err != nil {
+		t.Fatalf("approval: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result = %#v", result)
+	}
+	if payload["scope"] != "turn" || payload["strictAutoReview"] != true {
+		t.Fatalf("payload = %#v", payload)
+	}
+	permissions, _ := payload["permissions"].(map[string]any)
+	if len(permissions) != 0 {
+		t.Fatalf("permissions = %#v, want empty", permissions)
+	}
+}
+
+type fakePeer struct {
+	mu                 sync.Mutex
+	messages           []string
+	thoughts           []string
+	permissionRequests []acp.RequestPermissionRequest
+	permissionResponse acp.RequestPermissionResponse
+}
+
+func (f *fakePeer) SessionUpdate(_ context.Context, params acp.SessionNotification) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if params.Update.AgentMessageChunk != nil {
+		f.messages = append(f.messages, contentText(params.Update.AgentMessageChunk.Content))
+	}
+	if params.Update.AgentThoughtChunk != nil {
+		f.thoughts = append(f.thoughts, contentText(params.Update.AgentThoughtChunk.Content))
+	}
+	return nil
+}
+
+func (f *fakePeer) RequestPermission(_ context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permissionRequests = append(f.permissionRequests, params)
+	if f.permissionResponse.Outcome.Selected == nil && f.permissionResponse.Outcome.Cancelled == nil {
+		return selectedPermission("accept"), nil
+	}
+	return f.permissionResponse, nil
+}
+
+func contentText(block acp.ContentBlock) string {
+	if block.Text == nil {
+		return ""
+	}
+	return block.Text.Text
+}
+
+func selectedPermission(id string) acp.RequestPermissionResponse {
+	return acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
+		Selected: &acp.RequestPermissionOutcomeSelected{OptionId: acp.PermissionOptionId(id)},
+	}}
+}
+
+func writeAppServerHelper(t *testing.T, dir string) string {
+	t.Helper()
+	fakeCodex := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\nGO_WANT_HELPER_PROCESS=appserver " + shellQuote(os.Args[0]) + " -test.run=TestHelperProcess -- \"$@\"\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	return fakeCodex
+}
+
+func waitForActiveTurn(t *testing.T, session *appServerSession) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		session.mu.Lock()
+		active := session.activeTurnID != ""
+		session.mu.Unlock()
+		if active {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for active turn")
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "appserver" {
+		return
+	}
+	runFakeAppServer()
+	os.Exit(0)
+}
+
+func runFakeAppServer() {
+	scanner := bufio.NewScanner(os.Stdin)
+	writer := bufio.NewWriter(os.Stdout)
+	defer writer.Flush()
+	scenario := os.Getenv("FAKE_APP_SERVER_SCENARIO")
+	for scanner.Scan() {
+		var msg jsonRPCMessage
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			continue
+		}
+		if logPath := os.Getenv("FAKE_APP_SERVER_LOG"); logPath != "" {
+			f, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			if f != nil {
+				_, _ = f.WriteString(msg.Method + "\n")
+				_ = f.Close()
+			}
+		}
+		switch msg.Method {
+		case "initialize":
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"userAgent": "fake", "codexHome": "/tmp", "platformFamily": "unix", "platformOs": "macos"}})
+		case "thread/start":
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"thread": map[string]any{"id": "thread_1"}}})
+		case "turn/start":
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"turn": map[string]any{"id": "turn_1", "status": "inProgress"}}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "turn/started", "params": map[string]any{"threadId": "thread_1", "turn": map[string]any{"id": "turn_1", "status": "inProgress"}}})
+			if scenario == "wait" {
+				continue
+			}
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread_1", "turnId": "turn_1", "itemId": "item_1", "delta": "he"}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "item/reasoning/textDelta", "params": map[string]any{"threadId": "thread_1", "turnId": "turn_1", "itemId": "reason_1", "delta": "thinking"}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": map[string]any{"threadId": "thread_1", "turnId": "turn_1", "itemId": "item_1", "delta": "llo"}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "item/completed", "params": map[string]any{"threadId": "thread_1", "turnId": "turn_1", "item": map[string]any{"type": "agentMessage", "id": "item_1", "text": "hello"}}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "turn/completed", "params": map[string]any{"threadId": "thread_1", "turn": map[string]any{"id": "turn_1", "status": "completed"}}})
+		case "turn/interrupt":
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "turn/completed", "params": map[string]any{"threadId": "thread_1", "turn": map[string]any{"id": "turn_1", "status": "interrupted"}}})
+		}
+	}
+}
+
+func writeRPC(w *bufio.Writer, payload map[string]any) {
+	data, _ := json.Marshal(payload)
+	_, _ = w.Write(data)
+	_ = w.WriteByte('\n')
+	_ = w.Flush()
 }
 
 func shellQuote(s string) string {

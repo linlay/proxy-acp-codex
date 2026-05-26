@@ -21,6 +21,11 @@ import (
 
 var errCodexCLI = errors.New("codex cli returned an error")
 
+const (
+	backendAppServer = "app-server"
+	backendExecJSON  = "exec-json"
+)
+
 type multiFlag []string
 
 func (m *multiFlag) String() string { return strings.Join(*m, " ") }
@@ -31,8 +36,10 @@ func (m *multiFlag) Set(value string) error {
 
 type agent struct {
 	conn         *acp.AgentSideConnection
+	backend      string
 	codexCommand string
-	codexArgs    []string
+	execArgs     []string
+	appArgs      []string
 
 	mu        sync.Mutex
 	sessions  map[acp.SessionId]*sessionState
@@ -43,6 +50,7 @@ type agent struct {
 type sessionState struct {
 	cwd      string
 	threadID string
+	app      *appServerSession
 }
 
 type codexEvent struct {
@@ -52,7 +60,7 @@ type codexEvent struct {
 	Delta    string          `json:"delta"`
 	Text     string          `json:"text"`
 	Error    json.RawMessage `json:"error"`
-	Item     *codexItem     `json:"item"`
+	Item     *codexItem      `json:"item"`
 }
 
 type codexItem struct {
@@ -71,18 +79,26 @@ type codexStreamParser struct {
 }
 
 func Run(args []string) error {
-	var extra multiFlag
+	var execExtra multiFlag
+	var appExtra multiFlag
 	flags := flag.NewFlagSet("codex-cli-acp", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
+	backend := flags.String("backend", backendAppServer, "Codex backend: app-server or exec-json")
 	codexCommand := flags.String("codex", "codex", "Codex CLI command")
-	flags.Var(&extra, "arg", "Extra argument passed to Codex CLI, repeatable")
+	flags.Var(&execExtra, "arg", "Extra argument passed to codex exec, repeatable")
+	flags.Var(&appExtra, "app-server-arg", "Extra argument passed to codex app-server, repeatable")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *backend != backendAppServer && *backend != backendExecJSON {
+		return fmt.Errorf("unsupported codex backend %q", *backend)
+	}
 
 	a := &agent{
+		backend:      *backend,
 		codexCommand: *codexCommand,
-		codexArgs:    extra,
+		execArgs:     execExtra,
+		appArgs:      appExtra,
 		sessions:     map[acp.SessionId]*sessionState{},
 		active:       map[acp.SessionId]*exec.Cmd{},
 		cancelled:    map[acp.SessionId]bool{},
@@ -98,10 +114,19 @@ func (a *agent) Initialize(context.Context, acp.InitializeRequest) (acp.Initiali
 	return acp.InitializeResponse{ProtocolVersion: acp.ProtocolVersionNumber}, nil
 }
 
-func (a *agent) NewSession(_ context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+func (a *agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	id := acp.SessionId("sess_" + randomHex())
+	state := &sessionState{cwd: params.Cwd}
+	if a.backend == backendAppServer {
+		app, err := startAppServerSession(ctx, a.codexCommand, a.appArgs, params.Cwd, id, a.conn)
+		if err != nil {
+			return acp.NewSessionResponse{}, err
+		}
+		state.app = app
+		state.threadID = app.threadID
+	}
 	a.mu.Lock()
-	a.sessions[id] = &sessionState{cwd: params.Cwd}
+	a.sessions[id] = state
 	a.mu.Unlock()
 	return acp.NewSessionResponse{SessionId: id}, nil
 }
@@ -116,7 +141,18 @@ func (a *agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 	}
 
-	result, err := a.runCodex(ctx, params.SessionId, state.cwd, codexArgs(a.codexArgs, state.cwd, state.threadID, text))
+	if a.backend == backendAppServer {
+		if state.app == nil {
+			return acp.PromptResponse{}, fmt.Errorf("app-server backend is not initialized for session %q", params.SessionId)
+		}
+		stopReason, err := state.app.prompt(ctx, text)
+		if err != nil {
+			return acp.PromptResponse{}, err
+		}
+		return acp.PromptResponse{StopReason: stopReason}, nil
+	}
+
+	result, err := a.runCodex(ctx, params.SessionId, state.cwd, codexArgs(a.execArgs, state.cwd, state.threadID, text))
 	if result.threadID != "" {
 		a.setThreadID(params.SessionId, result.threadID)
 	}
@@ -236,6 +272,14 @@ func codexTextChunk(event codexEvent) string {
 }
 
 func (a *agent) Cancel(_ context.Context, params acp.CancelNotification) error {
+	if a.backend == backendAppServer {
+		state, ok := a.state(params.SessionId)
+		if ok && state.app != nil {
+			return state.app.cancel(context.Background())
+		}
+		return nil
+	}
+
 	a.mu.Lock()
 	cmd := a.active[params.SessionId]
 	a.cancelled[params.SessionId] = true
@@ -256,6 +300,7 @@ func (a *agent) LoadSession(context.Context, acp.LoadSessionRequest) (acp.LoadSe
 
 func (a *agent) CloseSession(_ context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	a.mu.Lock()
+	state := a.sessions[params.SessionId]
 	delete(a.sessions, params.SessionId)
 	if cmd := a.active[params.SessionId]; cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
@@ -263,6 +308,9 @@ func (a *agent) CloseSession(_ context.Context, params acp.CloseSessionRequest) 
 	delete(a.active, params.SessionId)
 	delete(a.cancelled, params.SessionId)
 	a.mu.Unlock()
+	if state != nil && state.app != nil {
+		state.app.close()
+	}
 	return acp.CloseSessionResponse{}, nil
 }
 

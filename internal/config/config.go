@@ -14,6 +14,7 @@ const (
 	defaultAddr          = "127.0.0.1"
 	defaultPort          = "3210"
 	defaultCodexCLI      = "codex"
+	defaultCodexBackend  = "app-server"
 	defaultIdleTimeoutMs = int64(30 * time.Minute / time.Millisecond)
 
 	DefaultCodexBackendKey = "codex"
@@ -73,7 +74,9 @@ func Load(path string) (Config, error) {
 		"PROXY_ACP_ADDR",
 		"PROXY_ACP_AUTH_TOKEN",
 		"CODEX_CLI",
+		"CODEX_BACKEND",
 		"CODEX_ARGS",
+		"CODEX_APP_SERVER_ARGS",
 		"PROXY_ACP_IDLE_TIMEOUT_MS",
 		"http_proxy",
 		"HTTP_PROXY",
@@ -108,13 +111,31 @@ func fromEnv(values map[string]string) (Config, error) {
 	if codexCLI == "" {
 		codexCLI = defaultCodexCLI
 	}
-	codexArgs, err := splitShellArgs(strings.TrimSpace(values["CODEX_ARGS"]))
-	if err != nil {
-		return Config{}, fmt.Errorf("CODEX_ARGS: %w", err)
+	codexBackend := strings.TrimSpace(envOrDefault(values, "CODEX_BACKEND", defaultCodexBackend))
+	if codexBackend == "" {
+		codexBackend = defaultCodexBackend
 	}
-	backendArgs := []string{CodexBackendModeArg, "-codex", codexCLI}
-	for _, arg := range codexArgs {
-		backendArgs = append(backendArgs, "-arg", arg)
+	if codexBackend != "app-server" && codexBackend != "exec-json" {
+		return Config{}, fmt.Errorf("CODEX_BACKEND must be app-server or exec-json")
+	}
+	backendArgs := []string{CodexBackendModeArg, "-backend", codexBackend, "-codex", codexCLI}
+	switch codexBackend {
+	case "app-server":
+		appServerArgs, err := splitShellArgs(strings.TrimSpace(values["CODEX_APP_SERVER_ARGS"]))
+		if err != nil {
+			return Config{}, fmt.Errorf("CODEX_APP_SERVER_ARGS: %w", err)
+		}
+		for _, arg := range appServerArgs {
+			backendArgs = append(backendArgs, "-app-server-arg", arg)
+		}
+	case "exec-json":
+		codexArgs, err := splitShellArgs(strings.TrimSpace(values["CODEX_ARGS"]))
+		if err != nil {
+			return Config{}, fmt.Errorf("CODEX_ARGS: %w", err)
+		}
+		for _, arg := range codexArgs {
+			backendArgs = append(backendArgs, "-arg", arg)
+		}
 	}
 	idleTimeoutMs := defaultIdleTimeoutMs
 	if raw := strings.TrimSpace(values["PROXY_ACP_IDLE_TIMEOUT_MS"]); raw != "" {

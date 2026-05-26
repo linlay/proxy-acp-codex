@@ -2,13 +2,13 @@
 
 ## 1. Project Overview
 
-`proxy-acp-codex` bridges Zenmind `agent-platform` PROXY agents to the local Codex CLI through ACP. It exposes the HTTP/SSE and WebSocket surface expected by the platform, then translates requests into ACP stdio sessions.
+`proxy-acp-codex` bridges Zenmind `agent-platform` PROXY agents to the local Codex CLI through ACP. It exposes the HTTP/SSE and WebSocket surface expected by the platform, then translates requests into ACP stdio sessions backed by Codex app-server true streaming.
 
 ```text
-webclient -> agent-platform(PROXY) -> proxy-acp-codex(HTTP/SSE + WS + internal ACP backend) -> Codex CLI
+webclient -> agent-platform(PROXY) -> proxy-acp-codex(HTTP/SSE + WS + internal ACP backend) -> Codex CLI app-server
 ```
 
-This project currently supports Codex CLI only. The proxy server, platform protocol handling, and ACP conversion layer are bundled into this repository and built into the `proxy-acp-codex` binary; users do not need to install the sibling `proxy-acp` project or a separate ACP adapter.
+This project currently supports Codex CLI only. The proxy server, platform protocol handling, and ACP conversion layer are bundled into this repository and built into the single `proxy-acp-codex` binary; users do not need to install the sibling `proxy-acp` project or a separate ACP adapter such as `codex-acp`.
 
 ## 2. Quick Start
 
@@ -22,7 +22,7 @@ This project currently supports Codex CLI only. The proxy server, platform proto
 
 ```bash
 cp .env.example .env
-# Edit CODEX_CLI and CODEX_ARGS in .env when needed.
+# Edit CODEX_CLI and CODEX_APP_SERVER_ARGS in .env when needed.
 make build
 make run
 ```
@@ -55,7 +55,9 @@ make test
 - `PROXY_ACP_ADDR` defaults to `127.0.0.1` when empty. To allow remote access, set it explicitly, for example `PROXY_ACP_ADDR=0.0.0.0`.
 - `PROXY_ACP_AUTH_TOKEN` defaults to empty, which leaves API routes unauthenticated. When set, clients must send `Authorization: Bearer <token>` or `?token=<token>`. For `agent-platform` PROXY agents, configure `proxyConfig.token` or `proxyConfig.tokenEnv` only when this token is set upstream.
 - `CODEX_CLI` defaults to `codex` and may be an absolute path.
-- `CODEX_ARGS` defaults to empty and accepts shell-style argument splitting. Values are passed to `codex exec` / `codex exec resume` before the prompt, for example `CODEX_ARGS="--model gpt-5"`.
+- `CODEX_BACKEND` defaults to `app-server`, which runs `codex app-server --listen stdio://` and forwards real Codex deltas. Set `CODEX_BACKEND=exec-json` only for the legacy `codex exec --json` adapter.
+- `CODEX_APP_SERVER_ARGS` defaults to empty and accepts shell-style argument splitting. Values are passed to `codex app-server` after `--listen stdio://`, for example `CODEX_APP_SERVER_ARGS="--enable network_proxy"`.
+- `CODEX_ARGS` is used only when `CODEX_BACKEND=exec-json`. Values are passed to `codex exec` / `codex exec resume` before the prompt, for example `CODEX_ARGS="--model gpt-5"`.
 - `PROXY_ACP_IDLE_TIMEOUT_MS` defaults to `1800000`.
 - `agent-platform` PROXY request timeout defaults to `300000ms`; `proxyConfig.timeoutMs` is only needed when overriding that default.
 
@@ -71,7 +73,7 @@ Runtime dependency model:
 
 ```text
 required on user machine: Codex CLI
-bundled by this project: HTTP/SSE/WS proxy, platform DTOs, ACP bridge, Codex JSONL adapter
+bundled by this project: HTTP/SSE/WS proxy, platform DTOs, ACP bridge, Codex app-server adapter
 ```
 
 ## 4. Deployment
@@ -116,16 +118,17 @@ The service writes process logs to stdout/stderr. Capture those streams through 
 
 - Confirm the configured port and address are reachable.
 - Confirm the configured Codex CLI command exists on `PATH` or is configured by absolute path.
+- Confirm the installed Codex CLI supports `codex app-server --listen stdio://`.
 - Confirm `agent-platform` sends `params.cwd` for each query.
 - Confirm the client sends the configured bearer token when `PROXY_ACP_AUTH_TOKEN` is set.
 - Confirm long-running sessions are not being closed by `PROXY_ACP_IDLE_TIMEOUT_MS`.
 
-The v1 Codex backend advertises file read only through ACP. Codex still owns its normal CLI approval and sandbox behavior when it executes work through `codex exec`, so use this proxy only for trusted local/platform access.
+The default Codex backend advertises file read only through ACP. Codex still owns its normal approval and sandbox behavior when it executes work through app-server, so use this proxy only for trusted local/platform access.
 
 ## Compatibility Surface
 
 - `POST /api/query` returns platform-compatible SSE with `event: message` and terminal `data: [DONE]`.
-- `POST /api/submit` forwards platform HITL approval responses to ACP `session/request_permission` when a backend requests permission. The Codex JSONL backend does not synthesize platform HITL events in v1.
+- `POST /api/submit` forwards platform HITL approval responses to ACP `session/request_permission` when Codex app-server requests command, file-change, or permission approval.
 - `POST /api/steer` queues a follow-up user prompt on the active ACP run.
 - `POST /api/interrupt` sends ACP `session/cancel`.
 - `GET /ws` accepts platform PROXY frames for query, submit, and interrupt.
