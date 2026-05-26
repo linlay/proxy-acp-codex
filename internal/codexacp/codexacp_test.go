@@ -46,6 +46,14 @@ func TestParseLineEmitsTextDeltas(t *testing.T) {
 	if !reflect.DeepEqual(parsed.chunks, []string{"lo"}) {
 		t.Fatalf("second chunks = %#v", parsed.chunks)
 	}
+
+	parsed, err = parser.parseLine([]byte(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":" done"}}`))
+	if err != nil {
+		t.Fatalf("parse completed item: %v", err)
+	}
+	if !reflect.DeepEqual(parsed.chunks, []string{" done"}) {
+		t.Fatalf("completed chunks = %#v", parsed.chunks)
+	}
 }
 
 func TestParseLineIgnoresMalformedAndLifecycleEvents(t *testing.T) {
@@ -75,6 +83,23 @@ func TestParseLineReturnsErrorMessage(t *testing.T) {
 	}
 	if !reflect.DeepEqual(parsed.chunks, []string{"boom"}) {
 		t.Fatalf("chunks = %#v", parsed.chunks)
+	}
+}
+
+func TestParseLineIgnoresTransientReconnectError(t *testing.T) {
+	parser := &codexStreamParser{}
+
+	for _, line := range [][]byte{
+		[]byte(`{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: Connection refused (os error 61))"}`),
+		[]byte(`{"type":"error","message":"Reconnecting... 2/5 (request timed out)"}`),
+	} {
+		parsed, err := parser.parseLine(line)
+		if err != nil {
+			t.Fatalf("parse %s: %v", line, err)
+		}
+		if parsed.threadID != "" || len(parsed.chunks) != 0 {
+			t.Fatalf("parsed %s = %#v", line, parsed)
+		}
 	}
 }
 

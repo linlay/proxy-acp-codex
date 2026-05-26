@@ -129,3 +129,4 @@ The v1 Codex backend advertises file read only through ACP. Codex still owns its
 - `POST /api/steer` queues a follow-up user prompt on the active ACP run.
 - `POST /api/interrupt` sends ACP `session/cancel`.
 - `GET /ws` accepts platform PROXY frames for query, submit, and interrupt.
+# proxy-acp-codex

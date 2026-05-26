@@ -52,6 +52,12 @@ type codexEvent struct {
 	Delta    string          `json:"delta"`
 	Text     string          `json:"text"`
 	Error    json.RawMessage `json:"error"`
+	Item     *codexItem     `json:"item"`
+}
+
+type codexItem struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type parseResult struct {
@@ -193,6 +199,9 @@ func (p *codexStreamParser) parseLine(line []byte) (parseResult, error) {
 	}
 	if event.Type == "error" || len(event.Error) > 0 {
 		msg := strings.TrimSpace(firstNonBlank(event.Message, event.Text, string(event.Error)))
+		if isTransientCodexStreamError(msg) {
+			return result, nil
+		}
 		if msg != "" {
 			result.chunks = []string{msg}
 		}
@@ -205,12 +214,22 @@ func (p *codexStreamParser) parseLine(line []byte) (parseResult, error) {
 	return result, nil
 }
 
+func isTransientCodexStreamError(msg string) bool {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	return strings.HasPrefix(msg, "reconnecting...")
+}
+
 func codexTextChunk(event codexEvent) string {
 	switch event.Type {
 	case "agent_message.delta", "message.delta", "response.output_text.delta":
 		return firstNonBlank(event.Delta, event.Text, event.Message)
 	case "agent_message", "message", "response.output_text.done":
 		return firstNonBlank(event.Message, event.Text)
+	case "item.completed":
+		if event.Item != nil && event.Item.Type == "agent_message" {
+			return event.Item.Text
+		}
+		return ""
 	default:
 		return ""
 	}
