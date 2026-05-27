@@ -21,9 +21,15 @@ type QueryRequest struct {
 	Message    string         `json:"message"`
 	References []Reference    `json:"references,omitempty"`
 	Params     map[string]any `json:"params,omitempty"`
+	Model      *ModelOptions  `json:"model,omitempty"`
 	Scene      *Scene         `json:"scene,omitempty"`
 	Stream     *bool          `json:"stream,omitempty"`
 	Hidden     *bool          `json:"hidden,omitempty"`
+}
+
+type ModelOptions struct {
+	Key     string `json:"key,omitempty"`
+	ModelID string `json:"modelId,omitempty"`
 }
 
 type Scene struct {
@@ -230,7 +236,7 @@ func DecodeJSON[T any](data []byte) (T, error) {
 func orderedPayloadKeys(eventType string) []string {
 	switch eventType {
 	case "request.query":
-		return []string{"requestId", "runId", "chatId", "agentKey", "role", "message", "references", "params", "scene"}
+		return []string{"requestId", "runId", "chatId", "agentKey", "role", "message", "references", "params", "model", "scene"}
 	case "run.start":
 		return []string{"runId", "chatId", "agentKey"}
 	case "content.start":

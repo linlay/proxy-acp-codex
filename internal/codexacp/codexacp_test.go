@@ -124,6 +124,24 @@ func TestCodexArgsStartAndResume(t *testing.T) {
 	}
 }
 
+func TestApplyCodexModelArgs(t *testing.T) {
+	execArgs, appArgs := applyCodexModelArgs(backendAppServer, []string{"--permission-mode", "ask"}, []string{"--enable", "network_proxy"}, "gpt-5-codex")
+	if !reflect.DeepEqual(execArgs, []string{"--permission-mode", "ask"}) {
+		t.Fatalf("exec args changed for app-server backend: %#v", execArgs)
+	}
+	if !reflect.DeepEqual(appArgs, []string{"--enable", "network_proxy", "-c", "model=gpt-5-codex"}) {
+		t.Fatalf("app args = %#v", appArgs)
+	}
+
+	execArgs, appArgs = applyCodexModelArgs(backendExecJSON, []string{"--permission-mode", "ask"}, []string{"--enable", "network_proxy"}, "gpt-5-codex")
+	if !reflect.DeepEqual(execArgs, []string{"--permission-mode", "ask", "--model", "gpt-5-codex"}) {
+		t.Fatalf("exec args = %#v", execArgs)
+	}
+	if !reflect.DeepEqual(appArgs, []string{"--enable", "network_proxy"}) {
+		t.Fatalf("app args changed for exec-json backend: %#v", appArgs)
+	}
+}
+
 func TestRunCodexCapturesThreadIDAndSupportsResumeArgs(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "argv.log")

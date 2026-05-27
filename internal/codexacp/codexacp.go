@@ -85,6 +85,7 @@ func Run(args []string) error {
 	flags.SetOutput(os.Stderr)
 	backend := flags.String("backend", backendAppServer, "Codex backend: app-server or exec-json")
 	codexCommand := flags.String("codex", "codex", "Codex CLI command")
+	model := flags.String("model", "", "Codex model override")
 	flags.Var(&execExtra, "arg", "Extra argument passed to codex exec, repeatable")
 	flags.Var(&appExtra, "app-server-arg", "Extra argument passed to codex app-server, repeatable")
 	if err := flags.Parse(args); err != nil {
@@ -93,12 +94,13 @@ func Run(args []string) error {
 	if *backend != backendAppServer && *backend != backendExecJSON {
 		return fmt.Errorf("unsupported codex backend %q", *backend)
 	}
+	execArgs, appArgs := applyCodexModelArgs(*backend, execExtra, appExtra, *model)
 
 	a := &agent{
 		backend:      *backend,
 		codexCommand: *codexCommand,
-		execArgs:     execExtra,
-		appArgs:      appExtra,
+		execArgs:     execArgs,
+		appArgs:      appArgs,
 		sessions:     map[acp.SessionId]*sessionState{},
 		active:       map[acp.SessionId]*exec.Cmd{},
 		cancelled:    map[acp.SessionId]bool{},
@@ -112,6 +114,22 @@ func Run(args []string) error {
 
 func (a *agent) Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error) {
 	return acp.InitializeResponse{ProtocolVersion: acp.ProtocolVersionNumber}, nil
+}
+
+func applyCodexModelArgs(backend string, execArgs []string, appArgs []string, model string) ([]string, []string) {
+	outExec := append([]string(nil), execArgs...)
+	outApp := append([]string(nil), appArgs...)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return outExec, outApp
+	}
+	switch backend {
+	case backendAppServer:
+		outApp = append(outApp, "-c", "model="+model)
+	case backendExecJSON:
+		outExec = append(outExec, "--model", model)
+	}
+	return outExec, outApp
 }
 
 func (a *agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {

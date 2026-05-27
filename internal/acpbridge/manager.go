@@ -59,11 +59,11 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) Execute(ctx context.Context, req platform.QueryRequest, sink EventSink) error {
-	backend, cwd, err := m.resolveBackend(req)
+	backend, cwd, model, err := m.resolveBackend(req)
 	if err != nil {
 		return err
 	}
-	sess, err := m.session(ctx, backend, req.ChatID, cwd)
+	sess, err := m.session(ctx, backend, req.ChatID, cwd, model)
 	if err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ func normalizeSteerID(steerID string) string {
 	return time.Now().UTC().Format("20060102150405.000000000")
 }
 
-func (m *Manager) resolveBackend(req platform.QueryRequest) (config.BackendConfig, string, error) {
+func (m *Manager) resolveBackend(req platform.QueryRequest) (config.BackendConfig, string, string, error) {
 	key := stringParam(req.Params, "backend")
 	if key == "" {
 		key = strings.TrimSpace(req.AgentKey)
@@ -192,24 +192,43 @@ func (m *Manager) resolveBackend(req platform.QueryRequest) (config.BackendConfi
 		backend, ok = m.cfg.Backend("")
 	}
 	if !ok {
-		return config.BackendConfig{}, "", fmt.Errorf("backend %q not configured", key)
+		return config.BackendConfig{}, "", "", fmt.Errorf("backend %q not configured", key)
 	}
 	cwd := stringParam(req.Params, "cwd")
 	if cwd == "" {
-		return config.BackendConfig{}, "", fmt.Errorf("params.cwd is required; agent-platform must provide the ACP session working directory")
+		return config.BackendConfig{}, "", "", fmt.Errorf("params.cwd is required; agent-platform must provide the ACP session working directory")
 	}
 	abs, err := filepath.Abs(cwd)
 	if err != nil {
-		return config.BackendConfig{}, "", err
+		return config.BackendConfig{}, "", "", err
 	}
-	return backend, abs, nil
+	return backend, abs, requestModel(req), nil
 }
 
-func (m *Manager) session(ctx context.Context, backend config.BackendConfig, chatID string, cwd string) (*backendSession, error) {
+func requestModel(req platform.QueryRequest) string {
+	if req.Model == nil {
+		return ""
+	}
+	if modelID := strings.TrimSpace(req.Model.ModelID); modelID != "" {
+		return modelID
+	}
+	return strings.TrimSpace(req.Model.Key)
+}
+
+func backendArgsWithModel(base []string, model string) []string {
+	args := append([]string(nil), base...)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return args
+	}
+	return append(args, "-model", model)
+}
+
+func (m *Manager) session(ctx context.Context, backend config.BackendConfig, chatID string, cwd string, model string) (*backendSession, error) {
 	if strings.TrimSpace(chatID) == "" {
 		chatID = "default"
 	}
-	key := backend.Key + "\x00" + chatID + "\x00" + cwd
+	key := backend.Key + "\x00" + chatID + "\x00" + cwd + "\x00" + model
 
 	m.mu.Lock()
 	if existing := m.sessions[key]; existing != nil && existing.alive() {
@@ -218,7 +237,7 @@ func (m *Manager) session(ctx context.Context, backend config.BackendConfig, cha
 	}
 	m.mu.Unlock()
 
-	sess, err := startBackendSession(ctx, backend, chatID, cwd)
+	sess, err := startBackendSession(ctx, backend, chatID, cwd, model)
 	if err != nil {
 		return nil, err
 	}
@@ -245,6 +264,7 @@ type backendSession struct {
 	cfg       config.BackendConfig
 	chatID    string
 	cwd       string
+	model     string
 	sessionID acp.SessionId
 	cmd       *exec.Cmd
 	conn      *acp.ClientSideConnection
@@ -257,12 +277,12 @@ type backendSession struct {
 	closed   bool
 }
 
-func startBackendSession(ctx context.Context, cfg config.BackendConfig, chatID string, cwd string) (*backendSession, error) {
+func startBackendSession(ctx context.Context, cfg config.BackendConfig, chatID string, cwd string, model string) (*backendSession, error) {
 	command, err := backendCommandPath(cfg.Command)
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(context.Background(), command, cfg.Args...)
+	cmd := exec.CommandContext(context.Background(), command, backendArgsWithModel(cfg.Args, model)...)
 	cmd.Dir = cwd
 	cmd.Env = mergeEnv(os.Environ(), cfg.Env)
 	cmd.Stderr = os.Stderr
@@ -278,7 +298,7 @@ func startBackendSession(ctx context.Context, cfg config.BackendConfig, chatID s
 		return nil, err
 	}
 
-	sess := &backendSession{cfg: cfg, chatID: chatID, cwd: cwd, cmd: cmd}
+	sess := &backendSession{cfg: cfg, chatID: chatID, cwd: cwd, model: model, cmd: cmd}
 	client := &bridgeClient{session: sess, terminals: map[string]*terminalProcess{}}
 	conn := acp.NewClientSideConnection(client, stdin, stdout)
 	conn.SetLogger(slog.Default())
@@ -366,6 +386,7 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 		"message":    req.Message,
 		"references": req.References,
 		"params":     req.Params,
+		"model":      req.Model,
 		"scene":      req.Scene,
 	})
 	t.emit("run.start", map[string]any{"runId": req.RunID, "chatId": req.ChatID, "agentKey": req.AgentKey})

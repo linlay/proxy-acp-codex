@@ -131,6 +131,30 @@ func TestManagerExecuteRequiresCWDParam(t *testing.T) {
 	}
 }
 
+func TestRequestModelPrefersModelID(t *testing.T) {
+	got := requestModel(platform.QueryRequest{Model: &platform.ModelOptions{Key: "gpt-5", ModelID: "gpt-5-codex"}})
+	if got != "gpt-5-codex" {
+		t.Fatalf("model = %q, want modelId", got)
+	}
+	got = requestModel(platform.QueryRequest{Model: &platform.ModelOptions{Key: "gpt-5"}})
+	if got != "gpt-5" {
+		t.Fatalf("model = %q, want key fallback", got)
+	}
+}
+
+func TestBackendArgsWithModel(t *testing.T) {
+	base := []string{config.CodexBackendModeArg, "-backend", "app-server"}
+	got := backendArgsWithModel(base, "gpt-5-codex")
+	want := []string{config.CodexBackendModeArg, "-backend", "app-server", "-model", "gpt-5-codex"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+	withoutModel := backendArgsWithModel(base, "")
+	if strings.Join(withoutModel, "\x00") != strings.Join(base, "\x00") {
+		t.Fatalf("args without model = %#v, want %#v", withoutModel, base)
+	}
+}
+
 func TestManagerSubmitResolvesACPPermission(t *testing.T) {
 	m := NewManager(testConfig(t))
 	defer m.Close()
