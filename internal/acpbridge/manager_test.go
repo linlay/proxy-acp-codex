@@ -142,6 +142,25 @@ func TestRequestModelPrefersModelID(t *testing.T) {
 	}
 }
 
+func TestRequestReasoningEffortNormalizesPlatformValue(t *testing.T) {
+	got := requestReasoningEffort(platform.QueryRequest{Model: &platform.ModelOptions{ReasoningEffort: "HIGH"}})
+	if got != "high" {
+		t.Fatalf("reasoning effort = %q, want high", got)
+	}
+	got = requestReasoningEffort(platform.QueryRequest{Model: &platform.ModelOptions{ReasoningEffort: "MEDIUM"}})
+	if got != "medium" {
+		t.Fatalf("reasoning effort = %q, want medium", got)
+	}
+	got = requestReasoningEffort(platform.QueryRequest{Model: &platform.ModelOptions{ReasoningEffort: "LOW"}})
+	if got != "low" {
+		t.Fatalf("reasoning effort = %q, want low", got)
+	}
+	got = requestReasoningEffort(platform.QueryRequest{Model: &platform.ModelOptions{ReasoningEffort: "EXTRA_HIGH"}})
+	if got != "xhigh" {
+		t.Fatalf("reasoning effort = %q, want xhigh", got)
+	}
+}
+
 func TestBackendArgsWithModel(t *testing.T) {
 	base := []string{config.CodexBackendModeArg, "-backend", "app-server"}
 	got := backendArgsWithModel(base, "gpt-5-codex")
@@ -152,6 +171,15 @@ func TestBackendArgsWithModel(t *testing.T) {
 	withoutModel := backendArgsWithModel(base, "")
 	if strings.Join(withoutModel, "\x00") != strings.Join(base, "\x00") {
 		t.Fatalf("args without model = %#v, want %#v", withoutModel, base)
+	}
+}
+
+func TestBackendArgsWithReasoningEffort(t *testing.T) {
+	base := []string{config.CodexBackendModeArg, "-backend", "app-server"}
+	got := backendArgsWithModelOptions(base, codexModelOptions{model: "gpt-5.5", reasoningEffort: "high"})
+	want := []string{config.CodexBackendModeArg, "-backend", "app-server", "-model", "gpt-5.5", "-model-reasoning-effort", "high"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
 	}
 }
 

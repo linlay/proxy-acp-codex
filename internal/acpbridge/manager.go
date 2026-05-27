@@ -182,7 +182,7 @@ func normalizeSteerID(steerID string) string {
 	return time.Now().UTC().Format("20060102150405.000000000")
 }
 
-func (m *Manager) resolveBackend(req platform.QueryRequest) (config.BackendConfig, string, string, error) {
+func (m *Manager) resolveBackend(req platform.QueryRequest) (config.BackendConfig, string, codexModelOptions, error) {
 	key := stringParam(req.Params, "backend")
 	if key == "" {
 		key = strings.TrimSpace(req.AgentKey)
@@ -192,17 +192,29 @@ func (m *Manager) resolveBackend(req platform.QueryRequest) (config.BackendConfi
 		backend, ok = m.cfg.Backend("")
 	}
 	if !ok {
-		return config.BackendConfig{}, "", "", fmt.Errorf("backend %q not configured", key)
+		return config.BackendConfig{}, "", codexModelOptions{}, fmt.Errorf("backend %q not configured", key)
 	}
 	cwd := stringParam(req.Params, "cwd")
 	if cwd == "" {
-		return config.BackendConfig{}, "", "", fmt.Errorf("params.cwd is required; agent-platform must provide the ACP session working directory")
+		return config.BackendConfig{}, "", codexModelOptions{}, fmt.Errorf("params.cwd is required; agent-platform must provide the ACP session working directory")
 	}
 	abs, err := filepath.Abs(cwd)
 	if err != nil {
-		return config.BackendConfig{}, "", "", err
+		return config.BackendConfig{}, "", codexModelOptions{}, err
 	}
-	return backend, abs, requestModel(req), nil
+	return backend, abs, requestCodexModelOptions(req), nil
+}
+
+type codexModelOptions struct {
+	model           string
+	reasoningEffort string
+}
+
+func requestCodexModelOptions(req platform.QueryRequest) codexModelOptions {
+	return codexModelOptions{
+		model:           requestModel(req),
+		reasoningEffort: requestReasoningEffort(req),
+	}
 }
 
 func requestModel(req platform.QueryRequest) string {
@@ -215,20 +227,50 @@ func requestModel(req platform.QueryRequest) string {
 	return strings.TrimSpace(req.Model.Key)
 }
 
-func backendArgsWithModel(base []string, model string) []string {
-	args := append([]string(nil), base...)
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return args
+func requestReasoningEffort(req platform.QueryRequest) string {
+	if req.Model == nil {
+		return ""
 	}
-	return append(args, "-model", model)
+	switch strings.ToUpper(strings.TrimSpace(req.Model.ReasoningEffort)) {
+	case "LOW":
+		return "low"
+	case "MEDIUM":
+		return "medium"
+	case "HIGH":
+		return "high"
+	case "XHIGH", "EXTRA_HIGH":
+		return "xhigh"
+	default:
+		return ""
+	}
 }
 
-func (m *Manager) session(ctx context.Context, backend config.BackendConfig, chatID string, cwd string, model string) (*backendSession, error) {
+func backendArgsWithModel(base []string, model string) []string {
+	return backendArgsWithModelOptions(base, codexModelOptions{model: model})
+}
+
+func backendArgsWithModelOptions(base []string, opts codexModelOptions) []string {
+	args := append([]string(nil), base...)
+	model := strings.TrimSpace(opts.model)
+	if model == "" {
+		if strings.TrimSpace(opts.reasoningEffort) == "" {
+			return args
+		}
+	} else {
+		args = append(args, "-model", model)
+	}
+	reasoningEffort := strings.TrimSpace(opts.reasoningEffort)
+	if reasoningEffort != "" {
+		args = append(args, "-model-reasoning-effort", reasoningEffort)
+	}
+	return args
+}
+
+func (m *Manager) session(ctx context.Context, backend config.BackendConfig, chatID string, cwd string, model codexModelOptions) (*backendSession, error) {
 	if strings.TrimSpace(chatID) == "" {
 		chatID = "default"
 	}
-	key := backend.Key + "\x00" + chatID + "\x00" + cwd + "\x00" + model
+	key := backend.Key + "\x00" + chatID + "\x00" + cwd + "\x00" + model.model + "\x00" + model.reasoningEffort
 
 	m.mu.Lock()
 	if existing := m.sessions[key]; existing != nil && existing.alive() {
@@ -264,7 +306,7 @@ type backendSession struct {
 	cfg       config.BackendConfig
 	chatID    string
 	cwd       string
-	model     string
+	model     codexModelOptions
 	sessionID acp.SessionId
 	cmd       *exec.Cmd
 	conn      *acp.ClientSideConnection
@@ -277,12 +319,12 @@ type backendSession struct {
 	closed   bool
 }
 
-func startBackendSession(ctx context.Context, cfg config.BackendConfig, chatID string, cwd string, model string) (*backendSession, error) {
+func startBackendSession(ctx context.Context, cfg config.BackendConfig, chatID string, cwd string, model codexModelOptions) (*backendSession, error) {
 	command, err := backendCommandPath(cfg.Command)
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(context.Background(), command, backendArgsWithModel(cfg.Args, model)...)
+	cmd := exec.CommandContext(context.Background(), command, backendArgsWithModelOptions(cfg.Args, model)...)
 	cmd.Dir = cwd
 	cmd.Env = mergeEnv(os.Environ(), cfg.Env)
 	cmd.Stderr = os.Stderr

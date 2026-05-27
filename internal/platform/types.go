@@ -28,8 +28,9 @@ type QueryRequest struct {
 }
 
 type ModelOptions struct {
-	Key     string `json:"key,omitempty"`
-	ModelID string `json:"modelId,omitempty"`
+	Key             string `json:"key,omitempty"`
+	ModelID         string `json:"modelId,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 type Scene struct {

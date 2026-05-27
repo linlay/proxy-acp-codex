@@ -86,6 +86,7 @@ func Run(args []string) error {
 	backend := flags.String("backend", backendAppServer, "Codex backend: app-server or exec-json")
 	codexCommand := flags.String("codex", "codex", "Codex CLI command")
 	model := flags.String("model", "", "Codex model override")
+	modelReasoningEffort := flags.String("model-reasoning-effort", "", "Codex model reasoning effort override")
 	flags.Var(&execExtra, "arg", "Extra argument passed to codex exec, repeatable")
 	flags.Var(&appExtra, "app-server-arg", "Extra argument passed to codex app-server, repeatable")
 	if err := flags.Parse(args); err != nil {
@@ -94,7 +95,7 @@ func Run(args []string) error {
 	if *backend != backendAppServer && *backend != backendExecJSON {
 		return fmt.Errorf("unsupported codex backend %q", *backend)
 	}
-	execArgs, appArgs := applyCodexModelArgs(*backend, execExtra, appExtra, *model)
+	execArgs, appArgs := applyCodexModelArgs(*backend, execExtra, appExtra, *model, *modelReasoningEffort)
 
 	a := &agent{
 		backend:      *backend,
@@ -116,18 +117,29 @@ func (a *agent) Initialize(context.Context, acp.InitializeRequest) (acp.Initiali
 	return acp.InitializeResponse{ProtocolVersion: acp.ProtocolVersionNumber}, nil
 }
 
-func applyCodexModelArgs(backend string, execArgs []string, appArgs []string, model string) ([]string, []string) {
+func applyCodexModelArgs(backend string, execArgs []string, appArgs []string, model string, reasoningEffort string) ([]string, []string) {
 	outExec := append([]string(nil), execArgs...)
 	outApp := append([]string(nil), appArgs...)
 	model = strings.TrimSpace(model)
-	if model == "" {
+	reasoningEffort = strings.TrimSpace(reasoningEffort)
+	if model == "" && reasoningEffort == "" {
 		return outExec, outApp
 	}
 	switch backend {
 	case backendAppServer:
-		outApp = append(outApp, "-c", "model="+model)
+		if model != "" {
+			outApp = append(outApp, "-c", "model="+model)
+		}
+		if reasoningEffort != "" {
+			outApp = append(outApp, "-c", "model_reasoning_effort="+reasoningEffort)
+		}
 	case backendExecJSON:
-		outExec = append(outExec, "--model", model)
+		if model != "" {
+			outExec = append(outExec, "--model", model)
+		}
+		if reasoningEffort != "" {
+			outExec = append(outExec, "-c", "model_reasoning_effort="+reasoningEffort)
+		}
 	}
 	return outExec, outApp
 }
