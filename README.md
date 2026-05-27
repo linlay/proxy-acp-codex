@@ -29,13 +29,17 @@ make run
 
 By default the service listens on `http://127.0.0.1:17071` and auth is disabled.
 
-Point `agent-platform` at this service with global platform config:
+Point `agent-platform` at this service from `configs/coder-settings.yml`:
 
 ```yaml
-CODER_ACP_BASE_URL=http://127.0.0.1:17071
+acp-proxies:
+  codex:
+    base-url: http://127.0.0.1:17071
+    timeout-ms: 300000
+    auth-token: ${CODEX_ACP_PROXY_TOKEN:}
 ```
 
-Then configure the agent as a CODER agent with `runtimeConfig.coderBackend: acp`. The platform must send `params.cwd` with each query. `proxy-acp-codex` does not choose a default working directory.
+Then configure the agent as a CODER agent with `runtimeConfig.acpProxyId: codex`. The platform treats that proxy id as the ACP CODER switch. The platform must send `params.cwd` with each query. `proxy-acp-codex` does not choose a default working directory.
 
 ### Test
 
@@ -51,13 +55,13 @@ make test
 - `.env` is local-only and must not be committed.
 - `PROXY_ACP_PORT` defaults to `17071`.
 - `PROXY_ACP_ADDR` defaults to `127.0.0.1` when empty. To allow remote access, set it explicitly, for example `PROXY_ACP_ADDR=0.0.0.0`.
-- `PROXY_ACP_AUTH_TOKEN` defaults to empty, which leaves API routes unauthenticated. When set, clients must send `Authorization: Bearer <token>` or `?token=<token>`. For `agent-platform` ACP CODER agents, configure `CODER_ACP_AUTH_TOKEN` only when this token is set upstream.
+- `PROXY_ACP_AUTH_TOKEN` defaults to empty, which leaves API routes unauthenticated. When set, clients must send `Authorization: Bearer <token>` or `?token=<token>`. For `agent-platform` ACP CODER agents, configure the matching `configs/coder-settings.yml` `acp-proxies.<id>.auth-token`.
 - `CODEX_CLI` defaults to `codex` and may be an absolute path.
 - `CODEX_BACKEND` defaults to `app-server`, which runs `codex app-server --listen stdio://` and forwards real Codex deltas. Set `CODEX_BACKEND=exec-json` only for the legacy `codex exec --json` adapter.
 - `CODEX_APP_SERVER_ARGS` defaults to empty and accepts shell-style argument splitting. Values are passed to `codex app-server` after `--listen stdio://`, for example `CODEX_APP_SERVER_ARGS="--enable network_proxy"`. When the platform sends `model.modelId` or `model.key`, this service appends `-c model=<model>` for that ACP session.
 - `CODEX_ARGS` is used only when `CODEX_BACKEND=exec-json`. Values are passed to `codex exec` / `codex exec resume` before the prompt. When the platform sends `model.modelId` or `model.key`, this service appends `--model <model>` for that ACP session.
 - `PROXY_ACP_IDLE_TIMEOUT_MS` defaults to `1800000`.
-- `agent-platform` ACP CODER request timeout defaults to `300000ms`; set `CODER_ACP_TIMEOUT_MS` in the platform only when overriding that default.
+- `agent-platform` ACP CODER request timeout defaults to `300000ms`; set `configs/coder-settings.yml` `acp-proxies.<id>.timeout-ms` in the platform only when overriding that default.
 
 Configuration priority:
 
