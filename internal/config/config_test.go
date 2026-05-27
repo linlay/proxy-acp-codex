@@ -13,7 +13,7 @@ func TestLoadDefaultsToLocalCodexBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.ListenAddr != "127.0.0.1:3210" {
+	if cfg.ListenAddr != "127.0.0.1:17071" {
 		t.Fatalf("listen addr = %q", cfg.ListenAddr)
 	}
 	if cfg.AuthToken != "" {

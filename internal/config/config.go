@@ -12,7 +12,7 @@ import (
 
 const (
 	defaultAddr          = "127.0.0.1"
-	defaultPort          = "3210"
+	defaultPort          = "17071"
 	defaultCodexCLI      = "codex"
 	defaultCodexBackend  = "app-server"
 	defaultIdleTimeoutMs = int64(30 * time.Minute / time.Millisecond)

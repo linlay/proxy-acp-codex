@@ -27,14 +27,14 @@ make build
 make run
 ```
 
-By default the service listens on `http://127.0.0.1:3210` and auth is disabled.
+By default the service listens on `http://127.0.0.1:17071` and auth is disabled.
 
 Point an `agent-platform` PROXY / ACP-PROXY agent at:
 
 ```yaml
 mode: PROXY
 proxyConfig:
-  baseUrl: http://127.0.0.1:3210
+  baseUrl: http://127.0.0.1:17071
 ```
 
 The platform must send `params.cwd` with each query. `proxy-acp-codex` does not choose a default working directory.
@@ -51,7 +51,7 @@ make test
 
 - `.env.example` is the committed example configuration.
 - `.env` is local-only and must not be committed.
-- `PROXY_ACP_PORT` defaults to `3210`.
+- `PROXY_ACP_PORT` defaults to `17071`.
 - `PROXY_ACP_ADDR` defaults to `127.0.0.1` when empty. To allow remote access, set it explicitly, for example `PROXY_ACP_ADDR=0.0.0.0`.
 - `PROXY_ACP_AUTH_TOKEN` defaults to empty, which leaves API routes unauthenticated. When set, clients must send `Authorization: Bearer <token>` or `?token=<token>`. For `agent-platform` PROXY agents, configure `proxyConfig.token` or `proxyConfig.tokenEnv` only when this token is set upstream.
 - `CODEX_CLI` defaults to `codex` and may be an absolute path.
@@ -107,7 +107,7 @@ Deployments should inject sensitive values through platform secrets or environme
 ### Health Check
 
 ```bash
-curl http://127.0.0.1:3210/healthz
+curl http://127.0.0.1:17071/healthz
 ```
 
 ### Logs
