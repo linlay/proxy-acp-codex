@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 const defaultTerminalOutputByteLimit = 1024 * 1024
 
 var terminalCounter uint64
+var terminalApprovalCounter uint64
 
 type terminalProcess struct {
 	id string
@@ -36,6 +38,38 @@ type terminalProcess struct {
 type terminalStatus struct {
 	ExitCode *int
 	Signal   *string
+}
+
+func nextTerminalApprovalID() acp.ToolCallId {
+	return acp.ToolCallId(fmt.Sprintf("terminal_%d", atomic.AddUint64(&terminalApprovalCounter, 1)))
+}
+
+func terminalCommandText(params acp.CreateTerminalRequest) string {
+	parts := []string{params.Command}
+	parts = append(parts, params.Args...)
+	return strings.Join(parts, " ")
+}
+
+func terminalRawInput(session *backendSession, params acp.CreateTerminalRequest) map[string]any {
+	cwd := session.cwd
+	if params.Cwd != nil && *params.Cwd != "" {
+		cwd = *params.Cwd
+	}
+	input := map[string]any{
+		"command": terminalCommandText(params),
+		"cwd":     cwd,
+	}
+	if len(params.Args) > 0 {
+		input["args"] = params.Args
+	}
+	if len(params.Env) > 0 {
+		env := make([]map[string]string, 0, len(params.Env))
+		for _, item := range params.Env {
+			env = append(env, map[string]string{"name": item.Name, "value": item.Value})
+		}
+		input["env"] = env
+	}
+	return input
 }
 
 func startTerminalProcess(session *backendSession, params acp.CreateTerminalRequest) (*terminalProcess, error) {
@@ -69,6 +103,7 @@ func startTerminalProcess(session *backendSession, params acp.CreateTerminalRequ
 	cmd := exec.CommandContext(context.Background(), params.Command, params.Args...)
 	cmd.Dir = cwd
 	cmd.Env = mergeEnv(os.Environ(), env)
+	prepareChildProcess(cmd)
 
 	term := &terminalProcess{
 		id:    fmt.Sprintf("term_%d", atomic.AddUint64(&terminalCounter, 1)),

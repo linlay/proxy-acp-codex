@@ -45,6 +45,22 @@ The platform must send `params.cwd` with each query. `proxy-acp-codex` does not 
 make test
 ```
 
+### Zenmind Plugin Package
+
+Build the Desktop plugin archive:
+
+```bash
+make release-plugin
+```
+
+This writes:
+
+```text
+dist/release/proxy-acp-codex-v0.1.0-darwin-arm64.tar.gz
+```
+
+Import that archive from Zenmind Desktop's plugin market. The archive contains the Go proxy binary, service lifecycle scripts, `.env.example`, and `manifest.json` with `kind: "plugin"`. The local Codex CLI remains a machine-level prerequisite and is not bundled.
+
 ## 3. Configuration
 
 `proxy-acp-codex` reads dotenv configuration from the `-env` flag, then `PROXY_ACP_ENV`, then `.env` in the working directory when present.
@@ -76,7 +92,25 @@ required on user machine: Codex CLI
 bundled by this project: HTTP/SSE/WS proxy, platform DTOs, ACP bridge, Codex app-server adapter
 ```
 
-## 4. Deployment
+## 4. Zenmind Desktop Integration
+
+This project is designed to match the existing Zenmind Desktop relay shape:
+
+1. Start `proxy-acp-codex`
+2. In `agent-platform/configs/coder-settings.yml`, add an ACP proxy entry:
+
+```yaml
+acp-proxies:
+  codex:
+    base-url: http://127.0.0.1:17071
+    timeout-ms: 300000
+```
+
+3. Point the target CODER/PROXY agent at `runtimeConfig.acpProxyId: codex`
+
+If you want Zenmind Desktop itself to launch this service, import the `make release-plugin` archive from the plugin market. The service contract remains `/api/query`, `/api/submit`, `/api/steer`, `/api/interrupt`, and `/ws`.
+
+## 5. Deployment
 
 Build the local binary:
 
@@ -102,7 +136,7 @@ Run with an explicit dotenv path:
 
 Deployments should inject sensitive values through platform secrets or environment-specific dotenv files outside source control. This repository does not currently include a Dockerfile or container orchestration definition.
 
-## 5. Operations
+## 6. Operations
 
 ### Health Check
 
@@ -125,7 +159,7 @@ The service writes process logs to stdout/stderr. Capture those streams through 
 
 The default Codex backend advertises file read only through ACP. Codex still owns its normal approval and sandbox behavior when it executes work through app-server, so use this proxy only for trusted local/platform access.
 
-## Compatibility Surface
+## 7. Compatibility Surface
 
 - `POST /api/query` returns platform-compatible SSE with `event: message` and terminal `data: [DONE]`.
 - `POST /api/submit` forwards platform HITL approval responses to ACP `session/request_permission` when Codex app-server requests command, file-change, or permission approval.

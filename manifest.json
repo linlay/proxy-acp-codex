@@ -1,0 +1,58 @@
+{
+  "kind": "plugin",
+  "id": "proxy-acp-codex",
+  "name": "Codex ACP Proxy",
+  "version": "v0.1.0",
+  "description": "Local ACP proxy service that lets Zenmind Desktop control the user's local Codex CLI runtime.",
+  "platform": {
+    "os": "darwin",
+    "arch": "arm64"
+  },
+  "frontend": {
+    "mode": "none"
+  },
+  "api": {
+    "enabled": true
+  },
+  "backend": {
+    "entry": "backend/proxy-acp-codex"
+  },
+  "scripts": {
+    "start": ["start.sh", "--daemon"],
+    "stop": "stop.sh",
+    "deploy": "deploy.sh"
+  },
+  "configFiles": [
+    {
+      "key": "env",
+      "label": ".env",
+      "relativePath": ".env",
+      "templateRelativePath": ".env.example",
+      "required": true
+    }
+  ],
+  "runtime": {
+    "pidRelativePath": "run/proxy-acp-codex.pid",
+    "logRelativePath": "run/proxy-acp-codex.log",
+    "requiredPaths": [
+      "backend/proxy-acp-codex",
+      "start.sh",
+      "stop.sh",
+      "deploy.sh",
+      "scripts/program-common.sh",
+      ".env.example",
+      "manifest.json"
+    ]
+  },
+  "web": {
+    "routePath": "/healthz",
+    "portEnvKey": "PROXY_ACP_PORT",
+    "defaultPort": 17071
+  },
+  "desktop": {
+    "displayOrder": 8,
+    "autoStart": "optional",
+    "bundleTopLevelDir": "proxy-acp-codex",
+    "systemRequirements": ["codex"]
+  }
+}

@@ -61,12 +61,29 @@ func (t *turn) emit(eventType string, payload map[string]any) {
 	if payload == nil {
 		payload = map[string]any{}
 	}
+	t.addEventContext(payload)
 	event := platform.NewEvent(t.seq.Add(1), eventType, payload)
 	if err := t.sink.Publish(event); err != nil {
 		// The HTTP/WS caller owns connection cancellation; publishing errors
 		// are intentionally not fatal inside ACP callbacks.
 		return
 	}
+}
+
+func (t *turn) addEventContext(payload map[string]any) {
+	setIfMissing := func(key string, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		if existing, ok := payload[key]; ok && strings.TrimSpace(fmt.Sprint(existing)) != "" {
+			return
+		}
+		payload[key] = value
+	}
+	setIfMissing("runId", t.req.RunID)
+	setIfMissing("chatId", t.req.ChatID)
+	setIfMissing("agentKey", t.req.AgentKey)
+	setIfMissing("teamId", t.req.TeamID)
 }
 
 func (t *turn) emitRunError(err error) {

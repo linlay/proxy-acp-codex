@@ -266,6 +266,7 @@ func startBackendSession(ctx context.Context, cfg config.BackendConfig, chatID s
 	cmd.Dir = cwd
 	cmd.Env = mergeEnv(os.Environ(), cfg.Env)
 	cmd.Stderr = os.Stderr
+	prepareChildProcess(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -525,9 +526,12 @@ func (c *bridgeClient) WriteTextFile(_ context.Context, params acp.WriteTextFile
 	return acp.WriteTextFileResponse{}, nil
 }
 
-func (c *bridgeClient) CreateTerminal(_ context.Context, params acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
+func (c *bridgeClient) CreateTerminal(ctx context.Context, params acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
 	if !c.session.cfg.Capabilities.TerminalEnabled() {
 		return acp.CreateTerminalResponse{}, fmt.Errorf("backend %q is not allowed to create terminals", c.session.cfg.Key)
+	}
+	if err := c.requestTerminalApproval(ctx, params); err != nil {
+		return acp.CreateTerminalResponse{}, err
 	}
 	term, err := startTerminalProcess(c.session, params)
 	if err != nil {
@@ -540,6 +544,38 @@ func (c *bridgeClient) CreateTerminal(_ context.Context, params acp.CreateTermin
 	c.terminals[term.id] = term
 	c.terminalMu.Unlock()
 	return acp.CreateTerminalResponse{TerminalId: term.id}, nil
+}
+
+func (c *bridgeClient) requestTerminalApproval(ctx context.Context, params acp.CreateTerminalRequest) error {
+	t := c.session.activeTurn()
+	if t == nil {
+		return fmt.Errorf("terminal request without active turn")
+	}
+	kind := acp.ToolKindExecute
+	status := acp.ToolCallStatusPending
+	command := terminalCommandText(params)
+	title := "Run command: " + command
+	resp, err := t.requestPermission(ctx, acp.RequestPermissionRequest{
+		SessionId: c.session.sessionID,
+		ToolCall: acp.ToolCallUpdate{
+			ToolCallId: nextTerminalApprovalID(),
+			Title:      &title,
+			Kind:       &kind,
+			Status:     &status,
+			RawInput:   terminalRawInput(c.session, params),
+		},
+		Options: []acp.PermissionOption{
+			{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+			{OptionId: "reject", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Outcome.Selected != nil && resp.Outcome.Selected.OptionId == "allow" {
+		return nil
+	}
+	return fmt.Errorf("terminal command rejected by user")
 }
 
 func (c *bridgeClient) KillTerminal(_ context.Context, params acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
