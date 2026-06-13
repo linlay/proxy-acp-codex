@@ -29,17 +29,7 @@ make run
 
 By default the service listens on `http://127.0.0.1:17071` and auth is disabled.
 
-Point `agent-platform` at this service from `configs/coder-settings.yml`:
-
-```yaml
-acp-proxies:
-  codex:
-    base-url: http://127.0.0.1:17071
-    timeout-ms: 300000
-    auth-token: ${CODEX_ACP_PROXY_TOKEN:}
-```
-
-Then configure the agent as a CODER agent with `runtimeConfig.acpProxyId: codex`. The platform treats that proxy id as the ACP CODER switch. The platform must send `params.cwd` with each query. `proxy-acp-codex` does not choose a default working directory.
+When launched by Zenmind Desktop, the plugin subscribes to Desktop bridge hooks and automatically registers the `codex` ACP proxy with `agent-platform`. Then configure the agent as a CODER agent with `runtimeConfig.acpProxyId: codex`. The platform treats that proxy id as the ACP CODER switch. The platform must send `params.cwd` with each query. `proxy-acp-codex` does not choose a default working directory.
 
 ### Test
 
@@ -96,10 +86,11 @@ bundled by this project: HTTP/SSE/WS proxy, platform DTOs, ACP bridge, Codex app
 
 ## 4. Zenmind Desktop Integration
 
-This project is designed to match the existing Zenmind Desktop relay shape:
+This project is designed to match the Zenmind Desktop plugin bridge shape:
 
-1. Start `proxy-acp-codex`
-2. In `agent-platform/configs/coder-settings.yml`, add an ACP proxy entry:
+1. Import the `make release-plugin` archive from the plugin market.
+2. Initialize and start `proxy-acp-codex` in Desktop.
+3. When Desktop emits `desktop.ready`, `agentPlatform.ready`, or `service.statusChanged:agent-platform`, the plugin sends `agentPlatform.upsertAcpProxy` to register:
 
 ```yaml
 acp-proxies:
@@ -108,9 +99,9 @@ acp-proxies:
     timeout-ms: 300000
 ```
 
-3. Point the target CODER/PROXY agent at `runtimeConfig.acpProxyId: codex`
+4. Point the target CODER/PROXY agent at `runtimeConfig.acpProxyId: codex`.
 
-If you want Zenmind Desktop itself to launch this service, import the `make release-plugin` archive from the plugin market. The service contract remains `/api/query`, `/api/submit`, `/api/steer`, `/api/interrupt`, and `/ws`.
+The service contract remains `/api/query`, `/api/submit`, `/api/steer`, `/api/interrupt`, and `/ws`. If the Desktop bridge environment variables are absent, the binary still runs as a standalone local proxy and does not modify `agent-platform` configuration.
 
 ## 5. Deployment
 

@@ -1,5 +1,5 @@
 {
-  "kind": "plugin",
+  "pluginApiVersion": 1,
   "id": "proxy-acp-codex",
   "name": "Codex ACP Proxy",
   "version": "v0.1.0",
@@ -8,8 +8,13 @@
     "os": "darwin",
     "arch": "arm64"
   },
-  "frontend": {
-    "mode": "none"
+  "service": {
+    "web": {
+      "healthPath": "/healthz",
+      "portEnvKey": "PROXY_ACP_PORT",
+      "defaultPort": 17071
+    },
+    "ui": "none"
   },
   "api": {
     "enabled": true
@@ -17,8 +22,11 @@
   "backend": {
     "entry": "backend/proxy-acp-codex"
   },
-  "scripts": {
-    "start": ["start.sh", "--daemon"],
+  "lifecycle": {
+    "start": [
+      "start.sh",
+      "--daemon"
+    ],
     "stop": "stop.sh",
     "deploy": "deploy.sh"
   },
@@ -44,15 +52,28 @@
       "manifest.json"
     ]
   },
-  "web": {
-    "routePath": "/healthz",
-    "portEnvKey": "PROXY_ACP_PORT",
-    "defaultPort": 17071
+  "hooks": {
+    "subscribe": [
+      "desktop.ready",
+      "desktop.beforeQuit",
+      "plugin.configChanged",
+      "service.statusChanged:agent-platform",
+      "agentPlatform.ready"
+    ]
+  },
+  "bridge": {
+    "requests": [
+      "service.getStatus",
+      "agentPlatform.upsertAcpProxy",
+      "agentPlatform.removeAcpProxy"
+    ]
   },
   "desktop": {
     "displayOrder": 8,
     "autoStart": "optional",
     "bundleTopLevelDir": "proxy-acp-codex",
-    "systemRequirements": ["codex"]
+    "systemRequirements": [
+      "codex"
+    ]
   }
 }
