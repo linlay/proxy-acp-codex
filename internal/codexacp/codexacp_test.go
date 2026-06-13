@@ -290,6 +290,126 @@ func TestAppServerCommandApprovalMapsToACPPermission(t *testing.T) {
 	}
 }
 
+func TestAppServerRequestUserInputMapsToACPQuestion(t *testing.T) {
+	peer := &fakePeer{permissionResponse: selectedQuestionPermission([]map[string]any{
+		{"id": "hitl_status", "answer": "已触发"},
+	})}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	result, err := session.handleServerRequest("item/tool/requestUserInput", []byte(`{
+		"itemId":"tool_1",
+		"threadId":"thread_1",
+		"turnId":"turn_1",
+		"questions":[{
+			"id":"hitl_status",
+			"header":"HITL 状态",
+			"question":"Codex HITL 是否已经触发？",
+			"options":[
+				{"label":"已触发","description":"Codex HITL 已触发"},
+				{"label":"未触发","description":"Codex HITL 未触发"}
+			]
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("request user input: %v", err)
+	}
+
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result = %#v", result)
+	}
+	answers, ok := payload["answers"].(map[string]any)
+	if !ok {
+		t.Fatalf("answers = %#v", payload["answers"])
+	}
+	answer, ok := answers["hitl_status"].(map[string]any)
+	if !ok {
+		t.Fatalf("hitl_status answer = %#v", answers["hitl_status"])
+	}
+	if got, want := answer["answers"], []string{"已触发"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("answer values = %#v, want %#v", got, want)
+	}
+
+	if len(peer.permissionRequests) != 1 {
+		t.Fatalf("permission requests = %#v", peer.permissionRequests)
+	}
+	req := peer.permissionRequests[0]
+	if req.ToolCall.ToolCallId != "tool_1" {
+		t.Fatalf("tool call id = %q", req.ToolCall.ToolCallId)
+	}
+	raw, ok := req.ToolCall.RawInput.(map[string]any)
+	if !ok {
+		t.Fatalf("raw input = %#v", req.ToolCall.RawInput)
+	}
+	if raw["mode"] != "question" {
+		t.Fatalf("mode = %#v", raw["mode"])
+	}
+	questions, ok := raw["questions"].([]map[string]any)
+	if !ok || len(questions) != 1 {
+		t.Fatalf("questions = %#v", raw["questions"])
+	}
+	if questions[0]["question"] != "Codex HITL 是否已经触发？" {
+		t.Fatalf("question = %#v", questions[0])
+	}
+}
+
+func TestAppServerMcpElicitationMapsToACPQuestion(t *testing.T) {
+	peer := &fakePeer{permissionResponse: selectedQuestionPermission([]map[string]any{
+		{"id": "choice", "answer": "red"},
+		{"id": "note", "answer": "继续"},
+	})}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	result, err := session.handleServerRequest("mcpServer/elicitation/request", []byte(`{
+		"serverName":"demo",
+		"threadId":"thread_1",
+		"turnId":"turn_1",
+		"mode":"form",
+		"message":"请选择后继续",
+		"requestedSchema":{
+			"type":"object",
+			"required":["choice"],
+			"properties":{
+				"choice":{"type":"string","title":"颜色","description":"选择颜色","enum":["red","blue"]},
+				"note":{"type":"string","title":"备注","description":"补充说明"}
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("elicitation: %v", err)
+	}
+
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result = %#v", result)
+	}
+	if payload["action"] != "accept" {
+		t.Fatalf("action = %#v", payload["action"])
+	}
+	content, ok := payload["content"].(map[string]any)
+	if !ok {
+		t.Fatalf("content = %#v", payload["content"])
+	}
+	if content["choice"] != "red" || content["note"] != "继续" {
+		t.Fatalf("content = %#v", content)
+	}
+
+	if len(peer.permissionRequests) != 1 {
+		t.Fatalf("permission requests = %#v", peer.permissionRequests)
+	}
+	raw, ok := peer.permissionRequests[0].ToolCall.RawInput.(map[string]any)
+	if !ok || raw["mode"] != "question" {
+		t.Fatalf("raw input = %#v", peer.permissionRequests[0].ToolCall.RawInput)
+	}
+	questions, ok := raw["questions"].([]map[string]any)
+	if !ok || len(questions) != 2 {
+		t.Fatalf("questions = %#v", raw["questions"])
+	}
+	if questions[0]["id"] != "choice" || questions[1]["id"] != "note" {
+		t.Fatalf("questions = %#v", questions)
+	}
+}
+
 func TestAppServerPermissionsApprovalRejectsToEmptyProfile(t *testing.T) {
 	peer := &fakePeer{permissionResponse: acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}}
 	session := &appServerSession{sessionID: "sess_test", conn: peer}
@@ -351,6 +471,17 @@ func contentText(block acp.ContentBlock) string {
 func selectedPermission(id string) acp.RequestPermissionResponse {
 	return acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
 		Selected: &acp.RequestPermissionOutcomeSelected{OptionId: acp.PermissionOptionId(id)},
+	}}
+}
+
+func selectedQuestionPermission(answers []map[string]any) acp.RequestPermissionResponse {
+	return acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
+		Selected: &acp.RequestPermissionOutcomeSelected{
+			OptionId: "submitted",
+			Meta: map[string]any{
+				"answers": answers,
+			},
+		},
 	}}
 }
 

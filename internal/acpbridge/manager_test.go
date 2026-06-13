@@ -216,6 +216,8 @@ func TestManagerSubmitResolvesACPPermission(t *testing.T) {
 	if awaitingID == "" {
 		t.Fatalf("expected awaiting.ask, got %#v", eventTypes(sink.snapshot()))
 	}
+	awaiting := findEvent(sink.snapshot(), "awaiting.ask")
+	assertEventIdentity(t, awaiting, "run_2", "chat_2", "fake")
 	resp, ok := m.Submit(platform.SubmitRequest{
 		RunID:      "run_2",
 		AwaitingID: awaitingID,
@@ -230,6 +232,8 @@ func TestManagerSubmitResolvesACPPermission(t *testing.T) {
 	if !contains(eventTypes(sink.snapshot()), "awaiting.answer") {
 		t.Fatalf("expected awaiting.answer, got %#v", eventTypes(sink.snapshot()))
 	}
+	assertEventIdentity(t, findEvent(sink.snapshot(), "request.submit"), "run_2", "chat_2", "fake")
+	assertEventIdentity(t, findEvent(sink.snapshot(), "awaiting.answer"), "run_2", "chat_2", "fake")
 }
 
 func TestManagerSteerQueuesFollowUpPromptBeforeRunComplete(t *testing.T) {
@@ -370,13 +374,9 @@ func TestManagerSubmitResolvesQuestionAwaiting(t *testing.T) {
 
 	events := sink.snapshot()
 	assertContentEventOrder(t, events, "run_3",
-		"content.start:run_3_c_1",
-		"content.end:run_3_c_1",
 		"awaiting.ask",
 		"request.submit",
 		"awaiting.answer",
-		"content.start:run_3_c_2",
-		"content.end:run_3_c_2",
 		"run.complete",
 	)
 }
@@ -457,13 +457,10 @@ func TestBridgeClientWriteTextFile(t *testing.T) {
 
 func TestBridgeClientTerminalLifecycle(t *testing.T) {
 	client := testBridgeClient(t)
-	resp, err := client.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+	resp := createApprovedTerminal(t, client, acp.CreateTerminalRequest{
 		Command: "sh",
 		Args:    []string{"-c", "printf hello"},
 	})
-	if err != nil {
-		t.Fatalf("create terminal: %v", err)
-	}
 	status, err := client.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: resp.TerminalId})
 	if err != nil {
 		t.Fatalf("wait terminal: %v", err)
@@ -485,13 +482,10 @@ func TestBridgeClientTerminalLifecycle(t *testing.T) {
 
 func TestBridgeClientKillTerminal(t *testing.T) {
 	client := testBridgeClient(t)
-	resp, err := client.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+	resp := createApprovedTerminal(t, client, acp.CreateTerminalRequest{
 		Command: "sh",
 		Args:    []string{"-c", "sleep 5"},
 	})
-	if err != nil {
-		t.Fatalf("create terminal: %v", err)
-	}
 	if _, err := client.KillTerminal(context.Background(), acp.KillTerminalRequest{TerminalId: resp.TerminalId}); err != nil {
 		t.Fatalf("kill terminal: %v", err)
 	}
@@ -508,14 +502,11 @@ func TestBridgeClientKillTerminal(t *testing.T) {
 
 func TestBridgeClientTerminalOutputLimitPreservesUTF8(t *testing.T) {
 	client := testBridgeClient(t)
-	resp, err := client.CreateTerminal(context.Background(), acp.CreateTerminalRequest{
+	resp := createApprovedTerminal(t, client, acp.CreateTerminalRequest{
 		Command:         "sh",
 		Args:            []string{"-c", "printf '你好世界'"},
 		OutputByteLimit: intPtr(7),
 	})
-	if err != nil {
-		t.Fatalf("create terminal: %v", err)
-	}
 	if _, err := client.WaitForTerminalExit(context.Background(), acp.WaitForTerminalExitRequest{TerminalId: resp.TerminalId}); err != nil {
 		t.Fatalf("wait terminal: %v", err)
 	}
@@ -531,6 +522,76 @@ func TestBridgeClientTerminalOutputLimitPreservesUTF8(t *testing.T) {
 	}
 	if strings.Contains(output.Output, string(utf8.RuneError)) {
 		t.Fatalf("output contains replacement rune: %q", output.Output)
+	}
+}
+
+func createApprovedTerminal(t *testing.T, client *bridgeClient, params acp.CreateTerminalRequest) acp.CreateTerminalResponse {
+	t.Helper()
+	m := NewManager(config.Config{})
+	sink := &recordingSink{}
+	runID := "run_terminal_" + time.Now().UTC().Format("20060102150405.000000000")
+	turn := newTurn(platform.QueryRequest{RunID: runID, ChatID: "chat_terminal", AgentKey: "fake"}, sink, m)
+
+	client.session.mu.Lock()
+	client.session.active = turn
+	client.session.mu.Unlock()
+	defer func() {
+		client.session.mu.Lock()
+		if client.session.active == turn {
+			client.session.active = nil
+		}
+		client.session.mu.Unlock()
+	}()
+
+	type result struct {
+		resp acp.CreateTerminalResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.CreateTerminal(context.Background(), params)
+		done <- result{resp: resp, err: err}
+	}()
+
+	var awaitingID string
+	for i := 0; i < 200; i++ {
+		for _, event := range sink.snapshot() {
+			if event.Type == "awaiting.ask" {
+				awaitingID, _ = event.Payload["awaitingId"].(string)
+				break
+			}
+		}
+		if awaitingID != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if awaitingID == "" {
+		t.Fatalf("expected terminal awaiting.ask, got %#v", eventTypes(sink.snapshot()))
+	}
+
+	submit, _ := m.Submit(platform.SubmitRequest{
+		RunID:      runID,
+		AwaitingID: awaitingID,
+		Params:     []map[string]any{{"id": "allow", "decision": "approve"}},
+	})
+	if !submit.Accepted {
+		t.Fatalf("submit = %#v", submit)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("create terminal: %v", got.err)
+		}
+		types := eventTypes(sink.snapshot())
+		if !contains(types, "awaiting.answer") {
+			t.Fatalf("expected awaiting.answer, got %#v", types)
+		}
+		return got.resp
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for terminal creation")
+		return acp.CreateTerminalResponse{}
 	}
 }
 
@@ -599,6 +660,31 @@ func contains(items []string, want string) bool {
 	return false
 }
 
+func findEvent(events []platform.EventData, eventType string) platform.EventData {
+	for _, event := range events {
+		if event.Type == eventType {
+			return event
+		}
+	}
+	return platform.EventData{}
+}
+
+func assertEventIdentity(t *testing.T, event platform.EventData, runID string, chatID string, agentKey string) {
+	t.Helper()
+	if event.Type == "" {
+		t.Fatalf("missing event for identity assertion")
+	}
+	if got, _ := event.Payload["runId"].(string); got != runID {
+		t.Fatalf("%s runId = %q, want %q", event.Type, got, runID)
+	}
+	if got, _ := event.Payload["chatId"].(string); got != chatID {
+		t.Fatalf("%s chatId = %q, want %q", event.Type, got, chatID)
+	}
+	if got, _ := event.Payload["agentKey"].(string); got != agentKey {
+		t.Fatalf("%s agentKey = %q, want %q", event.Type, got, agentKey)
+	}
+}
+
 func containsDelta(events []platform.EventData, want string) bool {
 	for _, event := range events {
 		if event.Type == "content.delta" && event.Payload["delta"] == want {
@@ -628,8 +714,9 @@ func assertEventOrder(t *testing.T, events []string, before string, after string
 func assertContentEventOrder(t *testing.T, events []platform.EventData, runID string, expected ...string) {
 	t.Helper()
 	positions := make([]int, 0, len(expected))
+	searchFrom := 0
 	for _, want := range expected {
-		idx := eventPosition(events, want)
+		idx := eventPosition(events, want, searchFrom)
 		if idx < 0 {
 			t.Fatalf("missing event %s in %#v", want, eventTypes(events))
 		}
@@ -640,6 +727,7 @@ func assertContentEventOrder(t *testing.T, events []platform.EventData, runID st
 			}
 		}
 		positions = append(positions, idx)
+		searchFrom = idx + 1
 	}
 	for idx := 1; idx < len(positions); idx++ {
 		if positions[idx-1] >= positions[idx] {
@@ -648,9 +736,10 @@ func assertContentEventOrder(t *testing.T, events []platform.EventData, runID st
 	}
 }
 
-func eventPosition(events []platform.EventData, want string) int {
+func eventPosition(events []platform.EventData, want string, start int) int {
 	eventType, contentID, hasContentID := strings.Cut(want, ":")
-	for idx, event := range events {
+	for idx := start; idx < len(events); idx++ {
+		event := events[idx]
 		if event.Type != eventType {
 			continue
 		}

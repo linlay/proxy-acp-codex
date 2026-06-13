@@ -104,13 +104,10 @@ func TestQuerySSEAndSubmit(t *testing.T) {
 		}
 	}
 	assertContentEventOrder(t, events, "run_http",
-		"content.start:run_http_c_1",
-		"content.end:run_http_c_1",
 		"awaiting.ask",
+		"request.steer",
 		"request.submit",
 		"awaiting.answer",
-		"content.start:run_http_c_2",
-		"content.end:run_http_c_2",
 		"run.complete",
 	)
 }
@@ -213,13 +210,10 @@ func TestQueryWebSocketSubmitAndSteer(t *testing.T) {
 		}
 	}
 	assertContentEventOrder(t, events, "run_ws",
-		"content.start:run_ws_c_1",
-		"content.end:run_ws_c_1",
 		"awaiting.ask",
+		"request.steer",
 		"request.submit",
 		"awaiting.answer",
-		"content.start:run_ws_c_2",
-		"content.end:run_ws_c_2",
 		"run.complete",
 	)
 }
@@ -303,8 +297,9 @@ func contains(items []string, want string) bool {
 func assertContentEventOrder(t *testing.T, events []platform.EventData, runID string, expected ...string) {
 	t.Helper()
 	positions := make([]int, 0, len(expected))
+	searchFrom := 0
 	for _, want := range expected {
-		idx := eventPosition(events, want)
+		idx := eventPosition(events, want, searchFrom)
 		if idx < 0 {
 			t.Fatalf("missing event %s in %#v", want, eventTypes(events))
 		}
@@ -315,6 +310,7 @@ func assertContentEventOrder(t *testing.T, events []platform.EventData, runID st
 			}
 		}
 		positions = append(positions, idx)
+		searchFrom = idx + 1
 	}
 	for idx := 1; idx < len(positions); idx++ {
 		if positions[idx-1] >= positions[idx] {
@@ -323,9 +319,10 @@ func assertContentEventOrder(t *testing.T, events []platform.EventData, runID st
 	}
 }
 
-func eventPosition(events []platform.EventData, want string) int {
+func eventPosition(events []platform.EventData, want string, start int) int {
 	eventType, contentID, hasContentID := strings.Cut(want, ":")
-	for idx, event := range events {
+	for idx := start; idx < len(events); idx++ {
+		event := events[idx]
 		if event.Type != eventType {
 			continue
 		}

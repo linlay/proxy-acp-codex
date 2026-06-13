@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ func startAppServerSession(ctx context.Context, codexCommand string, appArgs []s
 	cmd.Dir = cwd
 	cmd.Env = os.Environ()
 	cmd.Stderr = os.Stderr
+	prepareChildProcess(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -308,6 +310,10 @@ func (s *appServerSession) handleServerRequest(method string, params json.RawMes
 		return s.handleFileChangeApproval(params)
 	case "item/permissions/requestApproval":
 		return s.handlePermissionsApproval(params)
+	case "item/tool/requestUserInput":
+		return s.handleRequestUserInput(params)
+	case "mcpServer/elicitation/request":
+		return s.handleMCPElicitation(params)
 	default:
 		return nil, &jsonRPCError{Code: -32601, Message: "unsupported codex app-server request: " + method}
 	}
@@ -411,6 +417,72 @@ func (s *appServerSession) handlePermissionsApproval(params json.RawMessage) (an
 		}
 	}
 	return map[string]any{"permissions": map[string]any{}, "scope": "turn", "strictAutoReview": true}, nil
+}
+
+func (s *appServerSession) handleRequestUserInput(params json.RawMessage) (any, error) {
+	payload := map[string]any{}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return nil, err
+	}
+	id := firstNonBlank(stringField(payload, "itemId"), "question")
+	title := "Answer question"
+	kind := acp.ToolKindExecute
+	status := acp.ToolCallStatusPending
+	questions := questionMaps(payload["questions"])
+	response, err := s.conn.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+		SessionId: s.sessionID,
+		ToolCall: acp.ToolCallUpdate{
+			ToolCallId: acp.ToolCallId(id),
+			Title:      &title,
+			Kind:       &kind,
+			Status:     &status,
+			RawInput: map[string]any{
+				"mode":      "question",
+				"questions": questions,
+			},
+		},
+		Options: questionPermissionOptions(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.Outcome.Cancelled != nil {
+		return map[string]any{"answers": map[string]any{}}, nil
+	}
+	return map[string]any{"answers": appServerQuestionAnswers(response.Outcome)}, nil
+}
+
+func (s *appServerSession) handleMCPElicitation(params json.RawMessage) (any, error) {
+	payload := map[string]any{}
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return nil, err
+	}
+	id := firstNonBlank(stringField(payload, "itemId"), stringField(payload, "serverName"), "elicitation")
+	title := firstNonBlank(stringField(payload, "message"), "MCP elicitation")
+	kind := acp.ToolKindExecute
+	status := acp.ToolCallStatusPending
+	questions := elicitationQuestions(payload)
+	response, err := s.conn.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+		SessionId: s.sessionID,
+		ToolCall: acp.ToolCallUpdate{
+			ToolCallId: acp.ToolCallId(id),
+			Title:      &title,
+			Kind:       &kind,
+			Status:     &status,
+			RawInput: map[string]any{
+				"mode":      "question",
+				"questions": questions,
+			},
+		},
+		Options: questionPermissionOptions(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response.Outcome.Cancelled != nil {
+		return map[string]any{"action": "decline"}, nil
+	}
+	return map[string]any{"action": "accept", "content": elicitationContent(response.Outcome)}, nil
 }
 
 func (s *appServerSession) sendUpdate(update acp.SessionUpdate) {
@@ -560,6 +632,178 @@ func decisionStrings(raw any) []string {
 		if value, ok := item.(string); ok {
 			out = append(out, value)
 		}
+	}
+	return out
+}
+
+func questionPermissionOptions() []acp.PermissionOption {
+	return []acp.PermissionOption{
+		{OptionId: "submitted", Name: "Submit answer", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "cancelled", Name: "Cancel", Kind: acp.PermissionOptionKindRejectOnce},
+	}
+}
+
+func questionMaps(raw any) []map[string]any {
+	switch items := raw.(type) {
+	case []map[string]any:
+		return cloneMapSlice(items)
+	case []any:
+		out := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			if question, ok := item.(map[string]any); ok {
+				out = append(out, cloneAnyMap(question))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func elicitationQuestions(payload map[string]any) []map[string]any {
+	schema, _ := payload["requestedSchema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	if len(properties) == 0 {
+		return nil
+	}
+
+	keys := orderedSchemaKeys(schema, properties)
+	questions := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		prop, _ := properties[key].(map[string]any)
+		if prop == nil {
+			continue
+		}
+		question := map[string]any{
+			"id":       key,
+			"type":     "text",
+			"header":   firstNonBlank(stringField(prop, "title"), key),
+			"question": firstNonBlank(stringField(prop, "description"), stringField(prop, "title"), key),
+		}
+		if options := enumOptions(prop["enum"]); len(options) > 0 {
+			question["type"] = "select"
+			question["options"] = options
+		}
+		questions = append(questions, question)
+	}
+	return questions
+}
+
+func orderedSchemaKeys(schema map[string]any, properties map[string]any) []string {
+	seen := map[string]bool{}
+	keys := make([]string, 0, len(properties))
+	for _, key := range stringSlice(schema["required"]) {
+		if _, ok := properties[key]; ok && !seen[key] {
+			keys = append(keys, key)
+			seen[key] = true
+		}
+	}
+	rest := make([]string, 0, len(properties))
+	for key := range properties {
+		if !seen[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	keys = append(keys, rest...)
+	return keys
+}
+
+func enumOptions(raw any) []map[string]any {
+	values := stringSlice(raw)
+	if len(values) == 0 {
+		return nil
+	}
+	options := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		options = append(options, map[string]any{"label": value, "description": value})
+	}
+	return options
+}
+
+func appServerQuestionAnswers(outcome acp.RequestPermissionOutcome) map[string]any {
+	answers := questionAnswerMaps(outcome)
+	result := make(map[string]any, len(answers))
+	for _, answer := range answers {
+		id, _ := answer["id"].(string)
+		if id == "" {
+			continue
+		}
+		result[id] = map[string]any{"answers": answerValues(answer)}
+	}
+	return result
+}
+
+func elicitationContent(outcome acp.RequestPermissionOutcome) map[string]any {
+	answers := questionAnswerMaps(outcome)
+	content := make(map[string]any, len(answers))
+	for _, answer := range answers {
+		id, _ := answer["id"].(string)
+		if id == "" {
+			continue
+		}
+		content[id] = answerValue(answer)
+	}
+	return content
+}
+
+func questionAnswerMaps(outcome acp.RequestPermissionOutcome) []map[string]any {
+	if outcome.Selected == nil || outcome.Selected.Meta == nil {
+		return nil
+	}
+	return questionMaps(outcome.Selected.Meta["answers"])
+}
+
+func answerValues(answer map[string]any) []string {
+	if values, ok := answer["answers"]; ok {
+		return stringSlice(values)
+	}
+	if value, ok := answer["answer"]; ok {
+		return []string{fmt.Sprint(value)}
+	}
+	return nil
+}
+
+func answerValue(answer map[string]any) any {
+	if value, ok := answer["answer"]; ok {
+		return value
+	}
+	values := answerValues(answer)
+	if len(values) == 1 {
+		return values[0]
+	}
+	return values
+}
+
+func stringSlice(raw any) []string {
+	switch values := raw.(type) {
+	case []string:
+		return append([]string(nil), values...)
+	case []any:
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func cloneMapSlice(in []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, item := range in {
+		out = append(out, cloneAnyMap(item))
+	}
+	return out
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
 	}
 	return out
 }

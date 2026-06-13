@@ -200,6 +200,7 @@ func (a *agent) runCodex(ctx context.Context, sessionID acp.SessionId, cwd strin
 	cmd.Dir = cwd
 	cmd.Env = os.Environ()
 	cmd.Stderr = os.Stderr
+	prepareChildProcess(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return parseResult{}, err
