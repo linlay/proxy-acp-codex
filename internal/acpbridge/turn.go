@@ -265,8 +265,8 @@ func (t *turn) handleToolStart(tool acp.SessionUpdateToolCall) {
 	if tool.RawInput != nil {
 		t.emit("tool.args", map[string]any{"toolId": toolID, "delta": marshalAny(tool.RawInput), "chunkIndex": 0})
 	}
-	t.endTool(toolID)
 	if tool.Status == acp.ToolCallStatusCompleted || tool.Status == acp.ToolCallStatusFailed {
+		t.endTool(toolID)
 		t.emitToolResult(toolID, tool.RawOutput, tool.Status)
 	}
 }
@@ -293,12 +293,12 @@ func (t *turn) handleToolUpdate(update acp.SessionToolCallUpdate) {
 	if update.RawInput != nil {
 		t.emit("tool.args", map[string]any{"toolId": toolID, "delta": marshalAny(update.RawInput), "chunkIndex": 1})
 	}
-	t.endTool(toolID)
 	if update.Status != nil && (*update.Status == acp.ToolCallStatusCompleted || *update.Status == acp.ToolCallStatusFailed) {
 		result := update.RawOutput
 		if result == nil && len(update.Content) > 0 {
 			result = toolContentPayload(update.Content)
 		}
+		t.endTool(toolID)
 		t.emitToolResult(toolID, result, *update.Status)
 	}
 }
@@ -345,6 +345,11 @@ func (t *turn) requestPermission(ctx context.Context, params acp.RequestPermissi
 	if len(questions) > 0 {
 		mode = "question"
 	}
+	if mode == "approval" {
+		if accessLevel := t.mgr.runAccessLevel(t.req.RunID); accessLevelAllowsAutoApproval(accessLevel) {
+			return acp.RequestPermissionResponse{Outcome: permissionOutcomeFromAccessLevel(accessLevel, params.Options)}, nil
+		}
+	}
 	pending := &pendingPermission{
 		runID:      t.req.RunID,
 		awaitingID: awaitingID,
@@ -373,19 +378,6 @@ func (t *turn) requestPermission(ctx context.Context, params acp.RequestPermissi
 			"questions":    questions,
 		})
 	} else {
-		approvals := make([]map[string]any, 0, len(params.Options))
-		for _, option := range params.Options {
-			approvals = append(approvals, map[string]any{
-				"id":          string(option.OptionId),
-				"command":     permissionCommand(params.ToolCall),
-				"description": option.Name,
-				"options": []map[string]any{
-					{"label": option.Name, "decision": decisionForOption(option.Kind)},
-					{"label": "Reject", "decision": "reject"},
-				},
-				"allowFreeText": true,
-			})
-		}
 		t.emit("awaiting.ask", map[string]any{
 			"awaitingId":   awaitingID,
 			"mode":         "approval",
@@ -393,7 +385,7 @@ func (t *turn) requestPermission(ctx context.Context, params acp.RequestPermissi
 			"viewportKey":  "approval",
 			"timeout":      int64(120000),
 			"runId":        t.req.RunID,
-			"approvals":    approvals,
+			"approvals":    permissionApprovals(params.ToolCall, params.Options),
 		})
 	}
 
@@ -525,6 +517,42 @@ func decisionForOption(kind acp.PermissionOptionKind) string {
 	}
 }
 
+func permissionApprovals(tool acp.ToolCallUpdate, options []acp.PermissionOption) []map[string]any {
+	approvalOptions := make([]map[string]any, 0, len(options)+1)
+	description := ""
+	id := ""
+	for _, option := range options {
+		decision := decisionForOption(option.Kind)
+		if decision == "reject" {
+			continue
+		}
+		if id == "" {
+			id = string(option.OptionId)
+		}
+		if description == "" {
+			description = option.Name
+		}
+		approvalOptions = append(approvalOptions, map[string]any{
+			"label":    option.Name,
+			"decision": decision,
+		})
+	}
+	if id == "" && len(options) > 0 {
+		id = string(options[0].OptionId)
+	}
+	if description == "" {
+		description = "Approval required"
+	}
+	approvalOptions = append(approvalOptions, map[string]any{"label": "Reject", "decision": "reject"})
+	return []map[string]any{{
+		"id":            id,
+		"command":       permissionCommand(tool),
+		"description":   description,
+		"options":       approvalOptions,
+		"allowFreeText": true,
+	}}
+}
+
 func permissionOutcomeFromSubmit(params []map[string]any, options []acp.PermissionOption) acp.RequestPermissionOutcome {
 	if len(params) == 0 {
 		return acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}
@@ -533,6 +561,14 @@ func permissionOutcomeFromSubmit(params []map[string]any, options []acp.Permissi
 	id, _ := params[0]["id"].(string)
 	if strings.HasPrefix(strings.ToLower(decision), "reject") {
 		return acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}
+	}
+	if strings.EqualFold(decision, "approve_rule_run") || strings.EqualFold(decision, "approve_rule_session") {
+		if optionID := permissionOptionIDByKind(options, acp.PermissionOptionKindAllowAlways); optionID != "" {
+			id = optionID
+		}
+	}
+	if id == "" && strings.EqualFold(decision, "approve") {
+		id = permissionOptionIDByKind(options, acp.PermissionOptionKindAllowOnce)
 	}
 	if id == "" {
 		for _, option := range options {
@@ -549,6 +585,15 @@ func permissionOutcomeFromSubmit(params []map[string]any, options []acp.Permissi
 		return acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}
 	}
 	return acp.RequestPermissionOutcome{Selected: &acp.RequestPermissionOutcomeSelected{OptionId: acp.PermissionOptionId(id)}}
+}
+
+func permissionOptionIDByKind(options []acp.PermissionOption, kind acp.PermissionOptionKind) string {
+	for _, option := range options {
+		if option.Kind == kind {
+			return string(option.OptionId)
+		}
+	}
+	return ""
 }
 
 func questionPayload(raw any) []map[string]any {

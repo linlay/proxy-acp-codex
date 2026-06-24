@@ -40,6 +40,7 @@ type agent struct {
 	codexCommand string
 	execArgs     []string
 	appArgs      []string
+	options      codexRuntimeOptions
 
 	mu        sync.Mutex
 	sessions  map[acp.SessionId]*sessionState
@@ -74,6 +75,14 @@ type parseResult struct {
 	err      error
 }
 
+type codexRuntimeOptions struct {
+	model           string
+	reasoningEffort string
+	serviceTier     string
+	approvalPolicy  string
+	sandboxMode     string
+}
+
 type codexStreamParser struct {
 	seenText bool
 }
@@ -87,6 +96,9 @@ func Run(args []string) error {
 	codexCommand := flags.String("codex", "codex", "Codex CLI command")
 	model := flags.String("model", "", "Codex model override")
 	modelReasoningEffort := flags.String("model-reasoning-effort", "", "Codex model reasoning effort override")
+	serviceTier := flags.String("service-tier", "", "Codex service tier override")
+	approvalPolicy := flags.String("approval-policy", "", "Codex approval policy override")
+	sandboxMode := flags.String("sandbox-mode", "", "Codex sandbox mode override")
 	flags.Var(&execExtra, "arg", "Extra argument passed to codex exec, repeatable")
 	flags.Var(&appExtra, "app-server-arg", "Extra argument passed to codex app-server, repeatable")
 	if err := flags.Parse(args); err != nil {
@@ -95,13 +107,21 @@ func Run(args []string) error {
 	if *backend != backendAppServer && *backend != backendExecJSON {
 		return fmt.Errorf("unsupported codex backend %q", *backend)
 	}
-	execArgs, appArgs := applyCodexModelArgs(*backend, execExtra, appExtra, *model, *modelReasoningEffort)
+	options := codexRuntimeOptions{
+		model:           strings.TrimSpace(*model),
+		reasoningEffort: normalizeCodexReasoningEffort(*modelReasoningEffort),
+		serviceTier:     normalizeCodexServiceTier(*serviceTier),
+		approvalPolicy:  normalizeCodexApprovalPolicy(*approvalPolicy),
+		sandboxMode:     normalizeCodexSandboxMode(*sandboxMode),
+	}
+	execArgs, appArgs := applyCodexRuntimeArgs(*backend, execExtra, appExtra, options)
 
 	a := &agent{
 		backend:      *backend,
 		codexCommand: *codexCommand,
 		execArgs:     execArgs,
 		appArgs:      appArgs,
+		options:      options,
 		sessions:     map[acp.SessionId]*sessionState{},
 		active:       map[acp.SessionId]*exec.Cmd{},
 		cancelled:    map[acp.SessionId]bool{},
@@ -118,11 +138,21 @@ func (a *agent) Initialize(context.Context, acp.InitializeRequest) (acp.Initiali
 }
 
 func applyCodexModelArgs(backend string, execArgs []string, appArgs []string, model string, reasoningEffort string) ([]string, []string) {
+	return applyCodexRuntimeArgs(backend, execArgs, appArgs, codexRuntimeOptions{
+		model:           strings.TrimSpace(model),
+		reasoningEffort: normalizeCodexReasoningEffort(reasoningEffort),
+	})
+}
+
+func applyCodexRuntimeArgs(backend string, execArgs []string, appArgs []string, opts codexRuntimeOptions) ([]string, []string) {
 	outExec := append([]string(nil), execArgs...)
 	outApp := append([]string(nil), appArgs...)
-	model = strings.TrimSpace(model)
-	reasoningEffort = strings.TrimSpace(reasoningEffort)
-	if model == "" && reasoningEffort == "" {
+	model := strings.TrimSpace(opts.model)
+	reasoningEffort := normalizeCodexReasoningEffort(opts.reasoningEffort)
+	serviceTier := normalizeCodexServiceTier(opts.serviceTier)
+	approvalPolicy := normalizeCodexApprovalPolicy(opts.approvalPolicy)
+	sandboxMode := normalizeCodexSandboxMode(opts.sandboxMode)
+	if model == "" && reasoningEffort == "" && serviceTier == "" && approvalPolicy == "" && sandboxMode == "" {
 		return outExec, outApp
 	}
 	switch backend {
@@ -133,6 +163,15 @@ func applyCodexModelArgs(backend string, execArgs []string, appArgs []string, mo
 		if reasoningEffort != "" {
 			outApp = append(outApp, "-c", "model_reasoning_effort="+reasoningEffort)
 		}
+		if serviceTier != "" {
+			outApp = append(outApp, "-c", "service_tier="+serviceTier)
+		}
+		if approvalPolicy != "" {
+			outApp = append(outApp, "-c", "approval_policy="+approvalPolicy)
+		}
+		if sandboxMode != "" {
+			outApp = append(outApp, "-c", "sandbox_mode="+sandboxMode)
+		}
 	case backendExecJSON:
 		if model != "" {
 			outExec = append(outExec, "--model", model)
@@ -140,15 +179,60 @@ func applyCodexModelArgs(backend string, execArgs []string, appArgs []string, mo
 		if reasoningEffort != "" {
 			outExec = append(outExec, "-c", "model_reasoning_effort="+reasoningEffort)
 		}
+		if serviceTier != "" {
+			outExec = append(outExec, "-c", "service_tier="+serviceTier)
+		}
+		if approvalPolicy != "" {
+			outExec = append(outExec, "-c", "approval_policy="+approvalPolicy)
+		}
+		if sandboxMode != "" {
+			outExec = append(outExec, "--sandbox", sandboxMode)
+		}
 	}
 	return outExec, outApp
+}
+
+func normalizeCodexReasoningEffort(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func normalizeCodexServiceTier(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "fast", "flex":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func normalizeCodexApprovalPolicy(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "untrusted", "on-failure", "on-request", "never":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func normalizeCodexSandboxMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "read-only", "workspace-write", "danger-full-access":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
 }
 
 func (a *agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	id := acp.SessionId("sess_" + randomHex())
 	state := &sessionState{cwd: params.Cwd}
 	if a.backend == backendAppServer {
-		app, err := startAppServerSession(ctx, a.codexCommand, a.appArgs, params.Cwd, id, a.conn)
+		app, err := startAppServerSession(ctx, a.codexCommand, a.appArgs, a.options, params.Cwd, id, a.conn)
 		if err != nil {
 			return acp.NewSessionResponse{}, err
 		}
@@ -413,6 +497,29 @@ func promptText(params acp.PromptRequest) string {
 	for _, block := range params.Prompt {
 		if block.Text != nil && block.Text.Text != "" {
 			parts = append(parts, block.Text.Text)
+			continue
+		}
+		if block.ResourceLink != nil && block.ResourceLink.Uri != "" {
+			name := strings.TrimSpace(block.ResourceLink.Name)
+			if name == "" {
+				name = "resource"
+			}
+			parts = append(parts, fmt.Sprintf("[@%s](%s)", name, block.ResourceLink.Uri))
+			continue
+		}
+		if block.Image != nil {
+			if block.Image.Uri != nil && strings.TrimSpace(*block.Image.Uri) != "" {
+				parts = append(parts, fmt.Sprintf("[@image](%s)", strings.TrimSpace(*block.Image.Uri)))
+			} else if block.Image.Data != "" {
+				parts = append(parts, fmt.Sprintf("[image:%s base64 omitted]", block.Image.MimeType))
+			}
+			continue
+		}
+		if block.Resource != nil {
+			data, _ := json.Marshal(block.Resource.Resource)
+			if len(data) > 0 {
+				parts = append(parts, string(data))
+			}
 		}
 	}
 	return strings.Join(parts, "\n\n")

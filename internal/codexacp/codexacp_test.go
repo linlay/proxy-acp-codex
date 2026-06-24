@@ -142,6 +142,45 @@ func TestApplyCodexModelArgs(t *testing.T) {
 	}
 }
 
+func TestApplyCodexRuntimeArgsIncludesAccessPolicy(t *testing.T) {
+	execArgs, appArgs := applyCodexRuntimeArgs(backendAppServer, nil, []string{"--enable", "network_proxy"}, codexRuntimeOptions{
+		model:           "gpt-5-codex",
+		reasoningEffort: "high",
+		serviceTier:     "fast",
+		approvalPolicy:  "never",
+		sandboxMode:     "danger-full-access",
+	})
+	if len(execArgs) != 0 {
+		t.Fatalf("exec args changed for app-server backend: %#v", execArgs)
+	}
+	wantApp := []string{
+		"--enable", "network_proxy",
+		"-c", "model=gpt-5-codex",
+		"-c", "model_reasoning_effort=high",
+		"-c", "service_tier=fast",
+		"-c", "approval_policy=never",
+		"-c", "sandbox_mode=danger-full-access",
+	}
+	if !reflect.DeepEqual(appArgs, wantApp) {
+		t.Fatalf("app args = %#v, want %#v", appArgs, wantApp)
+	}
+
+	execArgs, appArgs = applyCodexRuntimeArgs(backendExecJSON, nil, []string{"--ignored"}, codexRuntimeOptions{
+		model:           "gpt-5-codex",
+		reasoningEffort: "low",
+		serviceTier:     "flex",
+		approvalPolicy:  "on-failure",
+		sandboxMode:     "workspace-write",
+	})
+	wantExec := []string{"--model", "gpt-5-codex", "-c", "model_reasoning_effort=low", "-c", "service_tier=flex", "-c", "approval_policy=on-failure", "--sandbox", "workspace-write"}
+	if !reflect.DeepEqual(execArgs, wantExec) {
+		t.Fatalf("exec args = %#v, want %#v", execArgs, wantExec)
+	}
+	if !reflect.DeepEqual(appArgs, []string{"--ignored"}) {
+		t.Fatalf("app args changed for exec-json backend: %#v", appArgs)
+	}
+}
+
 func TestRunCodexCapturesThreadIDAndSupportsResumeArgs(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "argv.log")
@@ -189,7 +228,7 @@ func TestAppServerSessionStreamsDeltasAndSuppressesCompletedDuplicate(t *testing
 	fakeCodex := writeAppServerHelper(t, dir)
 	peer := &fakePeer{}
 
-	session, err := startAppServerSession(context.Background(), fakeCodex, []string{"--fake-flag"}, dir, acp.SessionId("sess_test"), peer)
+	session, err := startAppServerSession(context.Background(), fakeCodex, []string{"--fake-flag"}, codexRuntimeOptions{}, dir, acp.SessionId("sess_test"), peer)
 	if err != nil {
 		t.Fatalf("start app-server session: %v", err)
 	}
@@ -207,6 +246,50 @@ func TestAppServerSessionStreamsDeltasAndSuppressesCompletedDuplicate(t *testing
 	}
 	if got, want := peer.thoughts, []string{"thinking"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("thoughts = %#v, want %#v", got, want)
+	}
+}
+
+func TestAppServerThreadStartIncludesModelAndAccessOptions(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "params.log")
+	fakeCodex := writeAppServerHelper(t, dir)
+	t.Setenv("FAKE_APP_SERVER_LOG", logPath)
+	t.Setenv("FAKE_APP_SERVER_LOG_PARAMS", "1")
+
+	session, err := startAppServerSession(context.Background(), fakeCodex, nil, codexRuntimeOptions{
+		model:           "gpt-5-codex",
+		reasoningEffort: "high",
+		approvalPolicy:  "never",
+		sandboxMode:     "danger-full-access",
+	}, dir, acp.SessionId("sess_test"), &fakePeer{})
+	if err != nil {
+		t.Fatalf("start app-server session: %v", err)
+	}
+	defer session.close()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var threadStart map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		method, raw, ok := strings.Cut(line, " ")
+		if !ok || method != "thread/start" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(raw), &threadStart); err != nil {
+			t.Fatalf("decode thread/start params: %v", err)
+		}
+	}
+	if threadStart == nil {
+		t.Fatalf("thread/start params not logged: %q", data)
+	}
+	if threadStart["model"] != "gpt-5-codex" || threadStart["approvalPolicy"] != "never" || threadStart["sandbox"] != "danger-full-access" {
+		t.Fatalf("thread/start params = %#v", threadStart)
+	}
+	config, ok := threadStart["config"].(map[string]any)
+	if !ok || config["model_reasoning_effort"] != "high" {
+		t.Fatalf("thread/start config = %#v", threadStart["config"])
 	}
 }
 
@@ -235,7 +318,7 @@ func TestAppServerCancelSendsInterrupt(t *testing.T) {
 	t.Setenv("FAKE_APP_SERVER_LOG", logPath)
 	peer := &fakePeer{}
 
-	session, err := startAppServerSession(context.Background(), fakeCodex, nil, dir, acp.SessionId("sess_test"), peer)
+	session, err := startAppServerSession(context.Background(), fakeCodex, nil, codexRuntimeOptions{}, dir, acp.SessionId("sess_test"), peer)
 	if err != nil {
 		t.Fatalf("start app-server session: %v", err)
 	}
@@ -431,10 +514,135 @@ func TestAppServerPermissionsApprovalRejectsToEmptyProfile(t *testing.T) {
 	}
 }
 
+func TestAppServerCoreItemEventsMapToACPUpdates(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/started", []byte(`{"item":{"type":"commandExecution","id":"cmd_1","status":"inProgress","command":"bash -lc \"go test ./...\"","cwd":"/tmp/work"}}`))
+	session.handleNotification("item/commandExecution/outputDelta", []byte(`{"itemId":"cmd_1","delta":"ok\n"}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"commandExecution","id":"cmd_1","status":"completed","command":"bash -lc \"go test ./...\"","cwd":"/tmp/work","exitCode":0}}`))
+	session.handleNotification("item/started", []byte(`{"item":{"type":"mcpToolCall","id":"mcp_1","status":"inProgress","server":"demo","tool":"lookup","arguments":{"q":"x"}}}`))
+	session.handleNotification("item/mcpToolCall/progress", []byte(`{"itemId":"mcp_1","message":"loading"}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"mcpToolCall","id":"mcp_1","status":"completed","server":"demo","tool":"lookup","result":{"ok":true},"error":null}}`))
+	session.handleNotification("turn/plan/updated", []byte(`{"plan":[{"step":"Inspect","status":"completed"},{"step":"Patch","status":"inProgress"}]}`))
+	session.handleNotification("thread/tokenUsage/updated", []byte(`{"tokenUsage":{"last":{"totalTokens":42},"modelContextWindow":1000}}`))
+
+	if got := len(peer.toolStarts); got != 2 {
+		t.Fatalf("tool starts = %d, want 2", got)
+	}
+	if peer.toolStarts[0].ToolCallId != "cmd_1" || peer.toolStarts[0].Kind != acp.ToolKindExecute {
+		t.Fatalf("command tool start = %#v", peer.toolStarts[0])
+	}
+	if peer.toolStarts[0].Title != `go test ./...` {
+		t.Fatalf("command title = %q", peer.toolStarts[0].Title)
+	}
+	if got := len(peer.toolUpdates); got != 2 {
+		t.Fatalf("tool updates = %d, want 2", got)
+	}
+	commandOutput, ok := peer.toolUpdates[0].RawOutput.(map[string]any)
+	if !ok {
+		t.Fatalf("command raw output = %#v", peer.toolUpdates[0].RawOutput)
+	}
+	if commandOutput["formatted_output"] != "ok\n" || commandOutput["exitCode"] != 0 {
+		t.Fatalf("command output = %#v", commandOutput)
+	}
+	mcpOutput, ok := peer.toolUpdates[1].RawOutput.(map[string]any)
+	if !ok {
+		t.Fatalf("mcp raw output = %#v", peer.toolUpdates[1].RawOutput)
+	}
+	if progress, ok := mcpOutput["progress"].([]string); !ok || !reflect.DeepEqual(progress, []string{"loading"}) {
+		t.Fatalf("mcp progress = %#v", mcpOutput["progress"])
+	}
+	if len(peer.plans) != 1 || len(peer.plans[0].Entries) != 2 {
+		t.Fatalf("plans = %#v", peer.plans)
+	}
+	if peer.plans[0].Entries[1].Status != acp.PlanEntryStatusInProgress {
+		t.Fatalf("plan status = %#v", peer.plans[0].Entries)
+	}
+	if len(peer.usages) != 1 || peer.usages[0].Used != 42 || peer.usages[0].Size != 1000 {
+		t.Fatalf("usage = %#v", peer.usages)
+	}
+}
+
+func TestAppServerImageViewDoesNotEmitDuplicateCompletion(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/started", []byte(`{"item":{"type":"imageView","id":"img_1","path":"/tmp/a.png"}}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"imageView","id":"img_1","path":"/tmp/a.png"}}`))
+
+	if got := len(peer.toolStarts); got != 1 {
+		t.Fatalf("tool starts = %d, want 1", got)
+	}
+	if peer.toolStarts[0].Status != acp.ToolCallStatusCompleted {
+		t.Fatalf("image view status = %q", peer.toolStarts[0].Status)
+	}
+	if got := len(peer.toolUpdates); got != 0 {
+		t.Fatalf("tool updates = %d, want no duplicate completion", got)
+	}
+}
+
+func TestAppServerFileChangeMapsToWebclientFileEditSummary(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/started", []byte(`{"item":{"type":"fileChange","id":"edit_1","status":"inProgress","changes":[{"path":"/tmp/app.go","diff":"@@\n-old\n+new\n+extra"}]}}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"fileChange","id":"edit_1","status":"completed","changes":[{"path":"/tmp/app.go","diff":"@@\n-old\n+new\n+extra"}]}}`))
+
+	if len(peer.toolStarts) != 1 {
+		t.Fatalf("tool starts = %#v", peer.toolStarts)
+	}
+	if peer.toolStarts[0].Title != "file_edit" || peer.toolStarts[0].Kind != "" {
+		t.Fatalf("file tool start = %#v", peer.toolStarts[0])
+	}
+	if len(peer.toolUpdates) != 1 {
+		t.Fatalf("tool updates = %#v", peer.toolUpdates)
+	}
+	output, ok := peer.toolUpdates[0].RawOutput.(map[string]any)
+	if !ok {
+		t.Fatalf("raw output = %#v", peer.toolUpdates[0].RawOutput)
+	}
+	if output["filePath"] != "/tmp/app.go" {
+		t.Fatalf("filePath = %#v", output["filePath"])
+	}
+	stats, ok := output["lineStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("lineStats = %#v", output["lineStats"])
+	}
+	if stats["addedLines"] != 2 || stats["deletedLines"] != 1 || stats["editedLines"] != 1 {
+		t.Fatalf("stats = %#v", stats)
+	}
+}
+
+func TestAppServerCommandActionsMapToReadAndSearchTools(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/started", []byte(`{"item":{"type":"commandExecution","id":"read_1","status":"inProgress","cwd":"/tmp/work","commandActions":[{"type":"read","path":"/tmp/work/main.go"}]}}`))
+	session.handleNotification("item/started", []byte(`{"item":{"type":"commandExecution","id":"search_1","status":"inProgress","cwd":"/tmp/work","commandActions":[{"type":"search","query":"TODO","path":"/tmp/work"}]}}`))
+
+	if len(peer.toolStarts) != 2 {
+		t.Fatalf("tool starts = %#v", peer.toolStarts)
+	}
+	if peer.toolStarts[0].Kind != acp.ToolKindRead || peer.toolStarts[0].Title != "Read file '/tmp/work/main.go'" {
+		t.Fatalf("read start = %#v", peer.toolStarts[0])
+	}
+	if len(peer.toolStarts[0].Locations) != 1 || peer.toolStarts[0].Locations[0].Path != "/tmp/work/main.go" {
+		t.Fatalf("read locations = %#v", peer.toolStarts[0].Locations)
+	}
+	if peer.toolStarts[1].Kind != acp.ToolKindSearch || peer.toolStarts[1].Title != "Search for 'TODO' in /tmp/work" {
+		t.Fatalf("search start = %#v", peer.toolStarts[1])
+	}
+}
+
 type fakePeer struct {
 	mu                 sync.Mutex
 	messages           []string
 	thoughts           []string
+	toolStarts         []acp.SessionUpdateToolCall
+	toolUpdates        []acp.SessionToolCallUpdate
+	plans              []acp.SessionUpdatePlan
+	usages             []acp.SessionUsageUpdate
 	permissionRequests []acp.RequestPermissionRequest
 	permissionResponse acp.RequestPermissionResponse
 }
@@ -447,6 +655,18 @@ func (f *fakePeer) SessionUpdate(_ context.Context, params acp.SessionNotificati
 	}
 	if params.Update.AgentThoughtChunk != nil {
 		f.thoughts = append(f.thoughts, contentText(params.Update.AgentThoughtChunk.Content))
+	}
+	if params.Update.ToolCall != nil {
+		f.toolStarts = append(f.toolStarts, *params.Update.ToolCall)
+	}
+	if params.Update.ToolCallUpdate != nil {
+		f.toolUpdates = append(f.toolUpdates, *params.Update.ToolCallUpdate)
+	}
+	if params.Update.Plan != nil {
+		f.plans = append(f.plans, *params.Update.Plan)
+	}
+	if params.Update.UsageUpdate != nil {
+		f.usages = append(f.usages, *params.Update.UsageUpdate)
 	}
 	return nil
 }
@@ -530,7 +750,11 @@ func runFakeAppServer() {
 		if logPath := os.Getenv("FAKE_APP_SERVER_LOG"); logPath != "" {
 			f, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 			if f != nil {
-				_, _ = f.WriteString(msg.Method + "\n")
+				if os.Getenv("FAKE_APP_SERVER_LOG_PARAMS") != "" {
+					_, _ = f.WriteString(msg.Method + " " + string(msg.Params) + "\n")
+				} else {
+					_, _ = f.WriteString(msg.Method + "\n")
+				}
 				_ = f.Close()
 			}
 		}

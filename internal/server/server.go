@@ -35,8 +35,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/api/models", s.withAuth(http.MethodGet, s.handleModels))
 	s.mux.HandleFunc("/api/query", s.withAuth(http.MethodPost, s.handleQuery))
 	s.mux.HandleFunc("/api/submit", s.withAuth(http.MethodPost, s.handleSubmit))
+	s.mux.HandleFunc("/api/access-level", s.withAuth(http.MethodPost, s.handleAccessLevel))
 	s.mux.HandleFunc("/api/steer", s.withAuth(http.MethodPost, s.handleSteer))
 	s.mux.HandleFunc("/api/interrupt", s.withAuth(http.MethodPost, s.handleInterrupt))
 	s.mux.HandleFunc("/ws", s.handleWS)
@@ -102,6 +104,16 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, _ := s.manager.Submit(req)
+	platform.WriteJSON(w, http.StatusOK, platform.Success(resp))
+}
+
+func (s *Server) handleAccessLevel(w http.ResponseWriter, r *http.Request) {
+	var req platform.AccessLevelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.RunID) == "" || strings.TrimSpace(req.AccessLevel) == "" {
+		platform.WriteJSON(w, http.StatusBadRequest, platform.Failure(http.StatusBadRequest, "runId and accessLevel are required"))
+		return
+	}
+	resp, _ := s.manager.UpdateAccessLevel(req)
 	platform.WriteJSON(w, http.StatusOK, platform.Success(resp))
 }
 

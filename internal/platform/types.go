@@ -12,25 +12,40 @@ import (
 const DoneSentinel = "[DONE]"
 
 type QueryRequest struct {
-	RequestID  string         `json:"requestId,omitempty"`
-	RunID      string         `json:"runId,omitempty"`
-	ChatID     string         `json:"chatId,omitempty"`
-	AgentKey   string         `json:"agentKey,omitempty"`
-	TeamID     string         `json:"teamId,omitempty"`
-	Role       string         `json:"role,omitempty"`
-	Message    string         `json:"message"`
-	References []Reference    `json:"references,omitempty"`
-	Params     map[string]any `json:"params,omitempty"`
-	Model      *ModelOptions  `json:"model,omitempty"`
-	Scene      *Scene         `json:"scene,omitempty"`
-	Stream     *bool          `json:"stream,omitempty"`
-	Hidden     *bool          `json:"hidden,omitempty"`
+	RequestID   string         `json:"requestId,omitempty"`
+	RunID       string         `json:"runId,omitempty"`
+	ChatID      string         `json:"chatId,omitempty"`
+	AgentKey    string         `json:"agentKey,omitempty"`
+	TeamID      string         `json:"teamId,omitempty"`
+	Role        string         `json:"role,omitempty"`
+	Message     string         `json:"message"`
+	References  []Reference    `json:"references,omitempty"`
+	Params      map[string]any `json:"params,omitempty"`
+	AccessLevel string         `json:"accessLevel,omitempty"`
+	Model       *ModelOptions  `json:"model,omitempty"`
+	Scene       *Scene         `json:"scene,omitempty"`
+	Stream      *bool          `json:"stream,omitempty"`
+	Hidden      *bool          `json:"hidden,omitempty"`
 }
 
 type ModelOptions struct {
 	Key             string `json:"key,omitempty"`
 	ModelID         string `json:"modelId,omitempty"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	ServiceTier     string `json:"serviceTier,omitempty"`
+}
+
+type ModelCatalogResponse struct {
+	Models []ModelCatalogItem `json:"models"`
+}
+
+type ModelCatalogItem struct {
+	Key           string   `json:"key"`
+	Name          string   `json:"name,omitempty"`
+	ModelID       string   `json:"modelId,omitempty"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	IsReasoner    bool     `json:"isReasoner,omitempty"`
+	ServiceTiers  []string `json:"serviceTiers,omitempty"`
 }
 
 type Scene struct {
@@ -73,6 +88,23 @@ type InterruptRequest struct {
 	AgentKey  string `json:"agentKey,omitempty"`
 	TeamID    string `json:"teamId,omitempty"`
 	Message   string `json:"message,omitempty"`
+}
+
+type AccessLevelRequest struct {
+	RequestID   string `json:"requestId,omitempty"`
+	RunID       string `json:"runId"`
+	AgentKey    string `json:"agentKey,omitempty"`
+	AccessLevel string `json:"accessLevel"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+type AccessLevelResponse struct {
+	Accepted            bool   `json:"accepted"`
+	Status              string `json:"status"`
+	RunID               string `json:"runId"`
+	PreviousAccessLevel string `json:"previousAccessLevel,omitempty"`
+	AccessLevel         string `json:"accessLevel"`
+	Detail              string `json:"detail,omitempty"`
 }
 
 type SubmitResponse struct {
@@ -237,7 +269,7 @@ func DecodeJSON[T any](data []byte) (T, error) {
 func orderedPayloadKeys(eventType string) []string {
 	switch eventType {
 	case "request.query":
-		return []string{"requestId", "runId", "chatId", "agentKey", "role", "message", "references", "params", "model", "scene"}
+		return []string{"requestId", "runId", "chatId", "agentKey", "role", "message", "references", "params", "accessLevel", "model", "scene"}
 	case "run.start":
 		return []string{"runId", "chatId", "agentKey"}
 	case "content.start":

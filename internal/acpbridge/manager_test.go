@@ -159,6 +159,63 @@ func TestRequestReasoningEffortNormalizesPlatformValue(t *testing.T) {
 	if got != "xhigh" {
 		t.Fatalf("reasoning effort = %q, want xhigh", got)
 	}
+	got = requestReasoningEffort(platform.QueryRequest{Model: &platform.ModelOptions{ReasoningEffort: "NONE"}})
+	if got != "" {
+		t.Fatalf("reasoning effort = %q, want empty for NONE", got)
+	}
+}
+
+func TestRequestServiceTierNormalizesPlatformValue(t *testing.T) {
+	got := requestServiceTier(platform.QueryRequest{Model: &platform.ModelOptions{ServiceTier: "FAST"}})
+	if got != "fast" {
+		t.Fatalf("service tier = %q, want fast", got)
+	}
+	got = requestServiceTier(platform.QueryRequest{Model: &platform.ModelOptions{ServiceTier: "STANDARD"}})
+	if got != "" {
+		t.Fatalf("standard service tier = %q, want empty", got)
+	}
+	got = requestServiceTier(platform.QueryRequest{Params: map[string]any{"serviceTier": "priority"}})
+	if got != "fast" {
+		t.Fatalf("params service tier = %q, want fast", got)
+	}
+}
+
+func TestRequestAccessLevelMapsToCodexPolicy(t *testing.T) {
+	opts := requestCodexSessionOptions(platform.QueryRequest{})
+	if opts.accessLevel != "" || opts.approvalPolicy != "" || opts.sandboxMode != "" {
+		t.Fatalf("empty access options = %#v", opts)
+	}
+
+	req := platform.QueryRequest{AccessLevel: "auto_approve"}
+	opts = requestCodexSessionOptions(req)
+	if opts.accessLevel != "auto_approve" || opts.approvalPolicy != "on-failure" || opts.sandboxMode != "workspace-write" {
+		t.Fatalf("auto approve options = %#v", opts)
+	}
+
+	req = platform.QueryRequest{AccessLevel: "full_access"}
+	opts = requestCodexSessionOptions(req)
+	if opts.accessLevel != "full_access" || opts.approvalPolicy != "never" || opts.sandboxMode != "danger-full-access" {
+		t.Fatalf("full access options = %#v", opts)
+	}
+
+	req = platform.QueryRequest{Params: map[string]any{"accessLevel": "default"}}
+	opts = requestCodexSessionOptions(req)
+	if opts.accessLevel != "default" || opts.approvalPolicy != "on-request" || opts.sandboxMode != "workspace-write" {
+		t.Fatalf("default options = %#v", opts)
+	}
+}
+
+func TestRequestCodexSessionOptionsAllowExplicitCodexOverrides(t *testing.T) {
+	opts := requestCodexSessionOptions(platform.QueryRequest{
+		AccessLevel: "default",
+		Params: map[string]any{
+			"approvalPolicy": "never",
+			"sandboxMode":    "danger-full-access",
+		},
+	})
+	if opts.approvalPolicy != "never" || opts.sandboxMode != "danger-full-access" {
+		t.Fatalf("options = %#v", opts)
+	}
 }
 
 func TestBackendArgsWithModel(t *testing.T) {
@@ -176,8 +233,17 @@ func TestBackendArgsWithModel(t *testing.T) {
 
 func TestBackendArgsWithReasoningEffort(t *testing.T) {
 	base := []string{config.CodexBackendModeArg, "-backend", "app-server"}
-	got := backendArgsWithModelOptions(base, codexModelOptions{model: "gpt-5.5", reasoningEffort: "high"})
-	want := []string{config.CodexBackendModeArg, "-backend", "app-server", "-model", "gpt-5.5", "-model-reasoning-effort", "high"}
+	got := backendArgsWithModelOptions(base, codexSessionOptions{model: "gpt-5.5", reasoningEffort: "high", serviceTier: "fast"})
+	want := []string{config.CodexBackendModeArg, "-backend", "app-server", "-model", "gpt-5.5", "-model-reasoning-effort", "high", "-service-tier", "fast"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBackendArgsWithAccessPolicy(t *testing.T) {
+	base := []string{config.CodexBackendModeArg, "-backend", "app-server"}
+	got := backendArgsWithSessionOptions(base, codexSessionOptions{approvalPolicy: "never", sandboxMode: "danger-full-access"})
+	want := []string{config.CodexBackendModeArg, "-backend", "app-server", "-approval-policy", "never", "-sandbox-mode", "danger-full-access"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -234,6 +300,111 @@ func TestManagerSubmitResolvesACPPermission(t *testing.T) {
 	}
 	assertEventIdentity(t, findEvent(sink.snapshot(), "request.submit"), "run_2", "chat_2", "fake")
 	assertEventIdentity(t, findEvent(sink.snapshot(), "awaiting.answer"), "run_2", "chat_2", "fake")
+}
+
+func TestManagerUpdateAccessLevelResolvesPendingApproval(t *testing.T) {
+	m := NewManager(testConfig(t))
+	defer m.Close()
+
+	sink := &recordingSink{}
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Execute(context.Background(), platform.QueryRequest{
+			RequestID:   "req_access",
+			RunID:       "run_access",
+			ChatID:      "chat_access",
+			AgentKey:    "fake",
+			Message:     "needs permission",
+			AccessLevel: "default",
+			Params:      testParams(t),
+		}, sink)
+	}()
+
+	var awaitingID string
+	for i := 0; i < 200; i++ {
+		for _, event := range sink.snapshot() {
+			if event.Type == "awaiting.ask" {
+				awaitingID, _ = event.Payload["awaitingId"].(string)
+				break
+			}
+		}
+		if awaitingID != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if awaitingID == "" {
+		t.Fatalf("expected awaiting.ask, got %#v", eventTypes(sink.snapshot()))
+	}
+
+	resp, ok := m.UpdateAccessLevel(platform.AccessLevelRequest{RunID: "run_access", AccessLevel: "auto_approve"})
+	if !ok || !resp.Accepted || resp.PreviousAccessLevel != "default" || resp.AccessLevel != "auto_approve" {
+		t.Fatalf("access response = %#v ok=%v", resp, ok)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	answer := findEvent(sink.snapshot(), "awaiting.answer")
+	if answer.Type == "" || answer.Payload["status"] != "answered" {
+		t.Fatalf("expected answered approval, got %#v", sink.snapshot())
+	}
+}
+
+func TestManagerUpdateAccessLevelRejectsInvalidValue(t *testing.T) {
+	m := NewManager(testConfig(t))
+	resp, ok := m.UpdateAccessLevel(platform.AccessLevelRequest{RunID: "run_missing", AccessLevel: "root"})
+	if ok || resp.Accepted || resp.Status != "invalid" {
+		t.Fatalf("access response = %#v ok=%v", resp, ok)
+	}
+}
+
+func TestPermissionOutcomePrefersAllowAlwaysForRuleDecision(t *testing.T) {
+	outcome := permissionOutcomeFromSubmit([]map[string]any{{"decision": "approve_rule_run"}}, []acp.PermissionOption{
+		{OptionId: "allow_once", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "allow_session", Name: "Allow for session", Kind: acp.PermissionOptionKindAllowAlways},
+		{OptionId: "reject", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+	})
+	if outcome.Selected == nil || outcome.Selected.OptionId != "allow_session" {
+		t.Fatalf("outcome = %#v, want allow_session", outcome)
+	}
+}
+
+func TestPermissionOutcomeRuleDecisionOverridesCollapsedApprovalID(t *testing.T) {
+	outcome := permissionOutcomeFromSubmit([]map[string]any{{"id": "allow_once", "decision": "approve_rule_run"}}, []acp.PermissionOption{
+		{OptionId: "allow_once", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "allow_session", Name: "Allow for session", Kind: acp.PermissionOptionKindAllowAlways},
+		{OptionId: "reject", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+	})
+	if outcome.Selected == nil || outcome.Selected.OptionId != "allow_session" {
+		t.Fatalf("outcome = %#v, want allow_session", outcome)
+	}
+}
+
+func TestPermissionApprovalsCollapseRejectOption(t *testing.T) {
+	title := "Run command"
+	approvals := permissionApprovals(acp.ToolCallUpdate{
+		ToolCallId: "tool_1",
+		Title:      &title,
+	}, []acp.PermissionOption{
+		{OptionId: "accept", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "decline", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+	})
+	if len(approvals) != 1 {
+		t.Fatalf("approvals = %#v, want one approval", approvals)
+	}
+	options, ok := approvals[0]["options"].([]map[string]any)
+	if !ok {
+		t.Fatalf("approval options = %#v", approvals[0]["options"])
+	}
+	if len(options) != 2 {
+		t.Fatalf("approval options = %#v, want allow + reject", options)
+	}
+	if options[0]["decision"] != "approve" || options[0]["label"] != "Allow once" {
+		t.Fatalf("first option = %#v, want Allow once approve", options[0])
+	}
+	if options[1]["decision"] != "reject" || options[1]["label"] != "Reject" {
+		t.Fatalf("second option = %#v, want Reject", options[1])
+	}
 }
 
 func TestManagerSteerQueuesFollowUpPromptBeforeRunComplete(t *testing.T) {

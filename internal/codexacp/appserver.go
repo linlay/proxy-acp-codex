@@ -27,6 +27,7 @@ type appServerSession struct {
 	sessionID acp.SessionId
 	cwd       string
 	threadID  string
+	options   codexRuntimeOptions
 	cmd       *exec.Cmd
 	rpc       *jsonRPCClient
 	conn      acpPeer
@@ -36,6 +37,9 @@ type appServerSession struct {
 	turnDone           chan appTurnResult
 	seenMessageDelta   map[string]bool
 	seenReasoningDelta map[string]bool
+	commandOutputs     map[string]*strings.Builder
+	mcpProgress        map[string][]string
+	completedOnStart   map[string]bool
 	closed             bool
 }
 
@@ -44,7 +48,7 @@ type appTurnResult struct {
 	err  error
 }
 
-func startAppServerSession(ctx context.Context, codexCommand string, appArgs []string, cwd string, sessionID acp.SessionId, conn acpPeer) (*appServerSession, error) {
+func startAppServerSession(ctx context.Context, codexCommand string, appArgs []string, options codexRuntimeOptions, cwd string, sessionID acp.SessionId, conn acpPeer) (*appServerSession, error) {
 	args := []string{"app-server", "--listen", "stdio://"}
 	args = append(args, appArgs...)
 
@@ -66,6 +70,7 @@ func startAppServerSession(ctx context.Context, codexCommand string, appArgs []s
 	session := &appServerSession{
 		sessionID: sessionID,
 		cwd:       cwd,
+		options:   options,
 		cmd:       cmd,
 		conn:      conn,
 	}
@@ -118,12 +123,32 @@ func (s *appServerSession) startThread(ctx context.Context) error {
 			ID string `json:"id"`
 		} `json:"thread"`
 	}
-	if err := s.rpc.call(ctx, "thread/start", map[string]any{
+	params := map[string]any{
 		"cwd":                    s.cwd,
 		"experimentalRawEvents":  false,
 		"persistExtendedHistory": false,
 		"ephemeral":              true,
-	}, &response); err != nil {
+	}
+	if model := strings.TrimSpace(s.options.model); model != "" {
+		params["model"] = model
+	}
+	config := map[string]any{}
+	if effort := normalizeCodexReasoningEffort(s.options.reasoningEffort); effort != "" {
+		config["model_reasoning_effort"] = effort
+	}
+	if serviceTier := normalizeCodexServiceTier(s.options.serviceTier); serviceTier != "" {
+		config["service_tier"] = serviceTier
+	}
+	if len(config) > 0 {
+		params["config"] = config
+	}
+	if approvalPolicy := normalizeCodexApprovalPolicy(s.options.approvalPolicy); approvalPolicy != "" {
+		params["approvalPolicy"] = approvalPolicy
+	}
+	if sandboxMode := normalizeCodexSandboxMode(s.options.sandboxMode); sandboxMode != "" {
+		params["sandbox"] = sandboxMode
+	}
+	if err := s.rpc.call(ctx, "thread/start", params, &response); err != nil {
 		return err
 	}
 	if strings.TrimSpace(response.Thread.ID) == "" {
@@ -253,12 +278,51 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 			s.markReasoningDelta(payload.ItemID)
 			s.sendUpdate(acp.UpdateAgentThoughtText(payload.Delta))
 		}
-	case "item/completed":
+	case "item/started":
 		var payload struct {
-			Item appServerItem `json:"item"`
+			Item json.RawMessage `json:"item"`
 		}
 		if json.Unmarshal(params, &payload) == nil {
-			s.handleCompletedItem(payload.Item)
+			if item, raw, ok := decodeAppServerItem(payload.Item); ok {
+				s.handleStartedItem(item, raw)
+			}
+		}
+	case "item/commandExecution/outputDelta":
+		var payload struct {
+			ItemID string `json:"itemId"`
+			Delta  string `json:"delta"`
+		}
+		if json.Unmarshal(params, &payload) == nil && payload.ItemID != "" {
+			s.appendCommandOutput(payload.ItemID, payload.Delta)
+		}
+	case "item/commandExecution/terminalInteraction":
+		var payload struct {
+			ItemID string `json:"itemId"`
+			Stdin  string `json:"stdin"`
+		}
+		if json.Unmarshal(params, &payload) == nil && payload.ItemID != "" && payload.Stdin != "" {
+			s.appendCommandOutput(payload.ItemID, "\n"+payload.Stdin+"\n")
+		}
+	case "item/mcpToolCall/progress":
+		var payload struct {
+			ItemID  string `json:"itemId"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(params, &payload) == nil && payload.ItemID != "" && strings.TrimSpace(payload.Message) != "" {
+			s.appendMCPProgress(payload.ItemID, payload.Message)
+		}
+	case "turn/plan/updated":
+		s.handlePlanUpdated(params)
+	case "thread/tokenUsage/updated":
+		s.handleTokenUsageUpdated(params)
+	case "item/completed":
+		var payload struct {
+			Item json.RawMessage `json:"item"`
+		}
+		if json.Unmarshal(params, &payload) == nil {
+			if item, raw, ok := decodeAppServerItem(payload.Item); ok {
+				s.handleCompletedItem(item, raw)
+			}
 		}
 	case "turn/completed":
 		var payload struct {
@@ -286,7 +350,29 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 	}
 }
 
-func (s *appServerSession) handleCompletedItem(item appServerItem) {
+func (s *appServerSession) handleStartedItem(item appServerItem, raw map[string]any) {
+	switch item.Type {
+	case "fileChange", "commandExecution", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration":
+		opts := []acp.ToolCallStartOpt{
+			acp.WithStartKind(itemToolKind(item)),
+			acp.WithStartStatus(itemToolStatus(item.Status, false)),
+			acp.WithStartRawInput(itemRawInput(item, raw)),
+		}
+		if locations := itemLocations(item, raw); len(locations) > 0 {
+			opts = append(opts, acp.WithStartLocations(locations))
+		}
+		if item.Type == "imageView" {
+			opts = append(opts,
+				acp.WithStartStatus(acp.ToolCallStatusCompleted),
+				acp.WithStartRawOutput(itemRawOutput(item, raw, "")),
+			)
+			s.markCompletedOnStart(item.ID)
+		}
+		s.sendUpdate(acp.StartToolCall(acp.ToolCallId(item.ID), itemToolTitle(item), opts...))
+	}
+}
+
+func (s *appServerSession) handleCompletedItem(item appServerItem, raw map[string]any) {
 	switch item.Type {
 	case "agentMessage":
 		if item.Text != "" && !s.hasMessageDelta(item.ID) {
@@ -299,7 +385,79 @@ func (s *appServerSession) handleCompletedItem(item appServerItem) {
 				s.sendUpdate(acp.UpdateAgentThoughtText(text))
 			}
 		}
+	case "fileChange", "commandExecution", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration":
+		if s.consumeCompletedOnStart(item.ID) {
+			return
+		}
+		output := itemRawOutput(item, raw, s.commandOutput(item.ID))
+		if item.Type == "mcpToolCall" {
+			if out, ok := output.(map[string]any); ok {
+				if progress := s.mcpProgressFor(item.ID); len(progress) > 0 {
+					out["progress"] = progress
+				}
+			}
+		}
+		opts := []acp.ToolCallUpdateOpt{
+			acp.WithUpdateTitle(itemToolTitle(item)),
+			acp.WithUpdateStatus(itemToolStatus(item.Status, true)),
+			acp.WithUpdateRawOutput(output),
+		}
+		if kind := itemToolKind(item); kind != "" {
+			opts = append(opts, acp.WithUpdateKind(kind))
+		}
+		s.sendUpdate(acp.UpdateToolCall(acp.ToolCallId(item.ID), opts...))
+		s.clearToolBuffers(item.ID)
 	}
+}
+
+func (s *appServerSession) handlePlanUpdated(params json.RawMessage) {
+	var payload struct {
+		Plan []struct {
+			Step     string `json:"step"`
+			Content  string `json:"content"`
+			Status   string `json:"status"`
+			Priority string `json:"priority"`
+		} `json:"plan"`
+	}
+	if json.Unmarshal(params, &payload) != nil || len(payload.Plan) == 0 {
+		return
+	}
+	entries := make([]acp.PlanEntry, 0, len(payload.Plan))
+	for _, item := range payload.Plan {
+		content := firstNonBlank(item.Step, item.Content)
+		if content == "" {
+			continue
+		}
+		entries = append(entries, acp.PlanEntry{
+			Content:  content,
+			Priority: planPriority(item.Priority),
+			Status:   planStatus(item.Status),
+		})
+	}
+	if len(entries) > 0 {
+		s.sendUpdate(acp.UpdatePlan(entries...))
+	}
+}
+
+func (s *appServerSession) handleTokenUsageUpdated(params json.RawMessage) {
+	var payload struct {
+		TokenUsage struct {
+			Last struct {
+				TotalTokens int `json:"totalTokens"`
+			} `json:"last"`
+			ModelContextWindow int `json:"modelContextWindow"`
+		} `json:"tokenUsage"`
+	}
+	if json.Unmarshal(params, &payload) != nil {
+		return
+	}
+	if payload.TokenUsage.Last.TotalTokens <= 0 || payload.TokenUsage.ModelContextWindow <= 0 {
+		return
+	}
+	s.sendUpdate(acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+		Used: payload.TokenUsage.Last.TotalTokens,
+		Size: payload.TokenUsage.ModelContextWindow,
+	}})
 }
 
 func (s *appServerSession) handleServerRequest(method string, params json.RawMessage) (any, error) {
@@ -566,6 +724,84 @@ func (s *appServerSession) hasReasoningDelta(itemID string) bool {
 	return s.seenReasoningDelta[itemID]
 }
 
+func (s *appServerSession) appendCommandOutput(itemID string, delta string) {
+	if delta == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.commandOutputs == nil {
+		s.commandOutputs = map[string]*strings.Builder{}
+	}
+	buf := s.commandOutputs[itemID]
+	if buf == nil {
+		buf = &strings.Builder{}
+		s.commandOutputs[itemID] = buf
+	}
+	buf.WriteString(delta)
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) commandOutput(itemID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commandOutputs == nil || s.commandOutputs[itemID] == nil {
+		return ""
+	}
+	return s.commandOutputs[itemID].String()
+}
+
+func (s *appServerSession) appendMCPProgress(itemID string, message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.mcpProgress == nil {
+		s.mcpProgress = map[string][]string{}
+	}
+	s.mcpProgress[itemID] = append(s.mcpProgress[itemID], message)
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) mcpProgressFor(itemID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.mcpProgress[itemID]) == 0 {
+		return nil
+	}
+	return append([]string(nil), s.mcpProgress[itemID]...)
+}
+
+func (s *appServerSession) clearToolBuffers(itemID string) {
+	s.mu.Lock()
+	if s.commandOutputs != nil {
+		delete(s.commandOutputs, itemID)
+	}
+	if s.mcpProgress != nil {
+		delete(s.mcpProgress, itemID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) markCompletedOnStart(itemID string) {
+	s.mu.Lock()
+	if s.completedOnStart == nil {
+		s.completedOnStart = map[string]bool{}
+	}
+	s.completedOnStart[itemID] = true
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) consumeCompletedOnStart(itemID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.completedOnStart[itemID] {
+		return false
+	}
+	delete(s.completedOnStart, itemID)
+	return true
+}
+
 type appServerTurn struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
@@ -576,11 +812,351 @@ type appServerTurn struct {
 }
 
 type appServerItem struct {
-	Type    string   `json:"type"`
-	ID      string   `json:"id"`
-	Text    string   `json:"text"`
-	Summary []string `json:"summary"`
-	Content []string `json:"content"`
+	Type             string           `json:"type"`
+	ID               string           `json:"id"`
+	Text             string           `json:"text"`
+	Summary          []string         `json:"summary"`
+	Content          []string         `json:"content"`
+	Status           string           `json:"status"`
+	Cwd              string           `json:"cwd"`
+	Command          string           `json:"command"`
+	CommandActions   []map[string]any `json:"commandActions"`
+	AggregatedOutput string           `json:"aggregatedOutput"`
+	ExitCode         *int             `json:"exitCode"`
+	Changes          []map[string]any `json:"changes"`
+	Server           string           `json:"server"`
+	Tool             string           `json:"tool"`
+	Arguments        any              `json:"arguments"`
+	Result           any              `json:"result"`
+	Error            any              `json:"error"`
+	Query            string           `json:"query"`
+	Action           map[string]any   `json:"action"`
+	Path             string           `json:"path"`
+	SavedPath        string           `json:"savedPath"`
+	RevisedPrompt    string           `json:"revisedPrompt"`
+}
+
+func decodeAppServerItem(raw json.RawMessage) (appServerItem, map[string]any, bool) {
+	if len(raw) == 0 {
+		return appServerItem{}, nil, false
+	}
+	var item appServerItem
+	if err := json.Unmarshal(raw, &item); err != nil || item.ID == "" || item.Type == "" {
+		return appServerItem{}, nil, false
+	}
+	var rawMap map[string]any
+	_ = json.Unmarshal(raw, &rawMap)
+	if rawMap == nil {
+		rawMap = map[string]any{}
+	}
+	return item, rawMap, true
+}
+
+func itemToolKind(item appServerItem) acp.ToolKind {
+	switch item.Type {
+	case "fileChange":
+		return ""
+	case "commandExecution":
+		if action := singleCommandAction(item); action != nil {
+			switch actionType(action) {
+			case "read", "listFiles":
+				return acp.ToolKindRead
+			case "search":
+				return acp.ToolKindSearch
+			}
+		}
+		return acp.ToolKindExecute
+	case "mcpToolCall", "dynamicToolCall":
+		return acp.ToolKindExecute
+	case "webSearch":
+		return acp.ToolKindSearch
+	case "imageView":
+		return acp.ToolKindRead
+	case "reasoning":
+		return acp.ToolKindThink
+	default:
+		return acp.ToolKindOther
+	}
+}
+
+func itemToolStatus(status string, complete bool) acp.ToolCallStatus {
+	switch strings.TrimSpace(status) {
+	case "inProgress", "in_progress", "running", "generating":
+		return acp.ToolCallStatusInProgress
+	case "completed", "approved":
+		return acp.ToolCallStatusCompleted
+	case "failed", "declined", "denied", "aborted", "timedOut":
+		return acp.ToolCallStatusFailed
+	}
+	if complete {
+		return acp.ToolCallStatusCompleted
+	}
+	return acp.ToolCallStatusPending
+}
+
+func itemToolTitle(item appServerItem) string {
+	switch item.Type {
+	case "fileChange":
+		return "file_edit"
+	case "commandExecution":
+		if action := singleCommandAction(item); action != nil {
+			return commandActionTitle(action)
+		}
+		if command := strings.TrimSpace(item.Command); command != "" {
+			return stripShellPrefix(command)
+		}
+		return "Run command"
+	case "mcpToolCall":
+		return "mcp." + firstNonBlank(item.Server, "server") + "." + firstNonBlank(item.Tool, "tool")
+	case "dynamicToolCall":
+		return firstNonBlank(item.Tool, "Dynamic tool")
+	case "webSearch":
+		return webSearchTitle(item)
+	case "imageView":
+		return "View image " + firstNonBlank(item.Path, item.ID)
+	case "imageGeneration":
+		return "Image generation"
+	default:
+		return firstNonBlank(item.Type, "tool")
+	}
+}
+
+func itemRawInput(item appServerItem, raw map[string]any) any {
+	switch item.Type {
+	case "commandExecution":
+		input := map[string]any{"command": item.Command, "cwd": item.Cwd}
+		if len(item.CommandActions) > 0 {
+			input["commandActions"] = item.CommandActions
+		}
+		return input
+	case "mcpToolCall":
+		return map[string]any{"server": item.Server, "tool": item.Tool, "arguments": item.Arguments}
+	case "dynamicToolCall":
+		return map[string]any{"tool": item.Tool, "arguments": item.Arguments}
+	case "fileChange":
+		return map[string]any{"changes": item.Changes}
+	case "webSearch":
+		return map[string]any{"query": item.Query, "action": item.Action}
+	case "imageView":
+		return map[string]any{"path": item.Path}
+	case "imageGeneration":
+		return map[string]any{"id": item.ID}
+	default:
+		return raw
+	}
+}
+
+func itemRawOutput(item appServerItem, raw map[string]any, commandOutput string) any {
+	switch item.Type {
+	case "commandExecution":
+		output := firstNonBlank(item.AggregatedOutput, commandOutput)
+		result := map[string]any{"formatted_output": output, "output": output}
+		if item.ExitCode != nil {
+			result["exitCode"] = *item.ExitCode
+			result["exit_code"] = *item.ExitCode
+		}
+		return result
+	case "mcpToolCall":
+		return map[string]any{"result": item.Result, "error": item.Error}
+	case "dynamicToolCall":
+		return map[string]any{"result": item.Result, "error": item.Error}
+	case "fileChange":
+		output := map[string]any{"changes": item.Changes, "status": item.Status}
+		if summary := fileChangeSummary(item.Changes); summary != nil {
+			for key, value := range summary {
+				output[key] = value
+			}
+		}
+		return output
+	case "imageGeneration":
+		return map[string]any{
+			"status":        item.Status,
+			"revisedPrompt": item.RevisedPrompt,
+			"result":        item.Result,
+			"savedPath":     item.SavedPath,
+		}
+	default:
+		if len(raw) > 0 {
+			return raw
+		}
+		return map[string]any{"status": item.Status}
+	}
+}
+
+func itemLocations(item appServerItem, raw map[string]any) []acp.ToolCallLocation {
+	switch item.Type {
+	case "commandExecution":
+		if action := singleCommandAction(item); action != nil {
+			if path := strings.TrimSpace(fmt.Sprint((*action)["path"])); path != "" {
+				return []acp.ToolCallLocation{{Path: path}}
+			}
+		}
+	case "imageView":
+		if strings.TrimSpace(item.Path) != "" {
+			return []acp.ToolCallLocation{{Path: item.Path}}
+		}
+	case "fileChange":
+		seen := map[string]bool{}
+		var locations []acp.ToolCallLocation
+		for _, change := range item.Changes {
+			path := strings.TrimSpace(fmt.Sprint(change["path"]))
+			if path == "" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			locations = append(locations, acp.ToolCallLocation{Path: path})
+		}
+		return locations
+	}
+	if path := strings.TrimSpace(fmt.Sprint(raw["path"])); path != "" {
+		return []acp.ToolCallLocation{{Path: path}}
+	}
+	return nil
+}
+
+func singleCommandAction(item appServerItem) *map[string]any {
+	if len(item.CommandActions) != 1 {
+		return nil
+	}
+	return &item.CommandActions[0]
+}
+
+func actionType(action *map[string]any) string {
+	if action == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint((*action)["type"]))
+}
+
+func commandActionTitle(action *map[string]any) string {
+	if action == nil {
+		return "Run command"
+	}
+	path := strings.TrimSpace(fmt.Sprint((*action)["path"]))
+	query := strings.TrimSpace(fmt.Sprint((*action)["query"]))
+	command := strings.TrimSpace(fmt.Sprint((*action)["command"]))
+	switch actionType(action) {
+	case "read":
+		if path != "" {
+			return "Read file '" + path + "'"
+		}
+		return "Read file"
+	case "search":
+		if query != "" && path != "" {
+			return "Search for '" + query + "' in " + path
+		}
+		if query != "" {
+			return "Search for '" + query + "'"
+		}
+		if path != "" {
+			return "Search in '" + path + "'"
+		}
+		return "Search"
+	case "listFiles":
+		if path != "" {
+			return "List files in '" + path + "'"
+		}
+		return "List files"
+	case "unknown":
+		if command != "" {
+			return stripShellPrefix(command)
+		}
+	}
+	return "Run command"
+}
+
+func fileChangeSummary(changes []map[string]any) map[string]any {
+	if len(changes) != 1 {
+		return nil
+	}
+	change := changes[0]
+	path := strings.TrimSpace(fmt.Sprint(change["path"]))
+	if path == "" {
+		return nil
+	}
+	added, deleted := diffLineStats(fmt.Sprint(change["diff"]))
+	edited := minInt(added, deleted)
+	return map[string]any{
+		"filePath": path,
+		"lineStats": map[string]any{
+			"addedLines":   added,
+			"deletedLines": deleted,
+			"editedLines":  edited,
+		},
+	}
+}
+
+func diffLineStats(diff string) (int, int) {
+	added := 0
+	deleted := 0
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
+			continue
+		}
+		if strings.HasPrefix(line, "+") {
+			added++
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			deleted++
+		}
+	}
+	return added, deleted
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func webSearchTitle(item appServerItem) string {
+	if len(item.Action) > 0 {
+		actionType, _ := item.Action["type"].(string)
+		switch actionType {
+		case "openPage":
+			return "Open page: " + strings.TrimSpace(fmt.Sprint(item.Action["url"]))
+		case "findInPage":
+			return "Find in page"
+		}
+	}
+	if query := strings.TrimSpace(item.Query); query != "" {
+		return "Web search: " + query
+	}
+	return "Web search"
+}
+
+func planPriority(priority string) acp.PlanEntryPriority {
+	switch strings.TrimSpace(priority) {
+	case "high":
+		return acp.PlanEntryPriorityHigh
+	case "low":
+		return acp.PlanEntryPriorityLow
+	default:
+		return acp.PlanEntryPriorityMedium
+	}
+}
+
+func planStatus(status string) acp.PlanEntryStatus {
+	switch strings.TrimSpace(status) {
+	case "inProgress", "in_progress":
+		return acp.PlanEntryStatusInProgress
+	case "completed", "done":
+		return acp.PlanEntryStatusCompleted
+	default:
+		return acp.PlanEntryStatusPending
+	}
+}
+
+func stripShellPrefix(command string) string {
+	command = strings.TrimSpace(command)
+	for _, prefix := range []string{"/bin/bash -lc ", "bash -lc ", "/bin/sh -lc ", "sh -lc "} {
+		if strings.HasPrefix(command, prefix) {
+			return strings.Trim(strings.TrimSpace(strings.TrimPrefix(command, prefix)), `"'`)
+		}
+	}
+	return command
 }
 
 func resultFromTurn(turn appServerTurn) (appTurnResult, bool) {

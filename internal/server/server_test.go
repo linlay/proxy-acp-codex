@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -110,6 +112,116 @@ func TestQuerySSEAndSubmit(t *testing.T) {
 		"awaiting.answer",
 		"run.complete",
 	)
+}
+
+func TestModelsEndpointUsesCodexDebugModels(t *testing.T) {
+	cfg := testConfig(t)
+	fakeCodex := filepath.Join(t.TempDir(), "fake-codex.sh")
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		"printf '%s' '{\"models\":[{\"slug\":\"gpt-5.5\",\"display_name\":\"GPT-5.5\",\"context_window\":272000,\"supported_reasoning_levels\":[{\"effort\":\"medium\"}],\"additional_speed_tiers\":[\"fast\"],\"service_tiers\":[{\"id\":\"priority\"}],\"visibility\":\"list\"},{\"slug\":\"gpt-5.3\",\"display_name\":\"GPT-5.3\",\"context_window\":128000,\"supported_reasoning_levels\":[{\"effort\":\"medium\"}],\"service_tiers\":[{\"id\":\"flex\"}],\"visibility\":\"list\"},{\"slug\":\"hidden-model\",\"display_name\":\"Hidden\",\"visibility\":\"hidden\"}]}'",
+	}, "\n")
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	cfg.Backends[0].Command = config.SelfBackendCommand
+	cfg.Backends[0].Args = []string{config.CodexBackendModeArg, "-backend", "app-server", "-codex", fakeCodex}
+
+	manager := acpbridge.NewManager(cfg)
+	defer manager.Close()
+	handler := New(cfg, manager)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/models")
+	if err != nil {
+		t.Fatalf("get models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("models status = %d: %s", resp.StatusCode, string(body))
+	}
+	var decoded platform.APIResponse[platform.ModelCatalogResponse]
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if len(decoded.Data.Models) != 2 {
+		t.Fatalf("models = %#v", decoded.Data.Models)
+	}
+	first := decoded.Data.Models[0]
+	if first.Key != "gpt-5.5" || first.Name != "GPT-5.5" || first.ModelID != "gpt-5.5" || first.ContextWindow != 272000 || !first.IsReasoner {
+		t.Fatalf("first model = %#v", first)
+	}
+	if strings.Join(first.ServiceTiers, ",") != "FAST" {
+		t.Fatalf("first service tiers = %#v", first.ServiceTiers)
+	}
+	second := decoded.Data.Models[1]
+	if strings.Join(second.ServiceTiers, ",") != "FLEX" {
+		t.Fatalf("second service tiers = %#v", second.ServiceTiers)
+	}
+}
+
+func TestAccessLevelEndpointResolvesPendingApproval(t *testing.T) {
+	cfg := testConfig(t)
+	manager := acpbridge.NewManager(cfg)
+	defer manager.Close()
+	handler := New(cfg, manager)
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	root := repoRoot(t)
+	body := fmt.Sprintf(`{"requestId":"req_access_http","runId":"run_access_http","chatId":"chat_access_http","agentKey":"fake","message":"needs permission","accessLevel":"default","params":{"cwd":%q}}`, root)
+	resp, err := http.Post(server.URL+"/api/query", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("post query: %v", err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+
+	awaiting := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		event, ok := readSSEEvent(t, reader)
+		if ok && event.Type == "awaiting.ask" {
+			awaiting = true
+			break
+		}
+	}
+	if !awaiting {
+		t.Fatalf("expected awaiting.ask")
+	}
+
+	accessResp, err := http.Post(server.URL+"/api/access-level", "application/json", strings.NewReader(`{"runId":"run_access_http","accessLevel":"auto_approve"}`))
+	if err != nil {
+		t.Fatalf("post access-level: %v", err)
+	}
+	defer accessResp.Body.Close()
+	if accessResp.StatusCode != http.StatusOK {
+		t.Fatalf("access status = %d", accessResp.StatusCode)
+	}
+	var decoded platform.APIResponse[platform.AccessLevelResponse]
+	if err := json.NewDecoder(accessResp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode access response: %v", err)
+	}
+	if !decoded.Data.Accepted || decoded.Data.AccessLevel != "auto_approve" {
+		t.Fatalf("access response = %#v", decoded.Data)
+	}
+
+	done := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read remaining sse: %v", err)
+		}
+		if strings.TrimSpace(line) == "data: [DONE]" {
+			done = true
+			break
+		}
+	}
+	if !done {
+		t.Fatalf("expected stream done after access-level update")
+	}
 }
 
 func TestQueryWebSocketSubmitAndSteer(t *testing.T) {
