@@ -21,18 +21,20 @@ type turn struct {
 
 	seq atomic.Int64
 
-	mu             sync.Mutex
-	contentOpen    bool
-	contentID      string
-	contentSeq     int
-	reasoningOpen  bool
-	reasoningID    string
-	planSeen       bool
-	toolStarted    map[string]bool
-	toolEnded      map[string]bool
-	steers         []platform.SteerRequest
-	acceptingSteer bool
-	interrupted    bool
+	mu                  sync.Mutex
+	contentOpen         bool
+	contentID           string
+	contentSeq          int
+	activeReasoningBase string
+	activeReasoningID   string
+	reasoningFallbackID string
+	reasoningSegments   map[string]int
+	planSeen            bool
+	toolStarted         map[string]bool
+	toolEnded           map[string]bool
+	steers              []platform.SteerRequest
+	acceptingSteer      bool
+	interrupted         bool
 }
 
 type pendingPermission struct {
@@ -47,13 +49,14 @@ type pendingPermission struct {
 
 func newTurn(req platform.QueryRequest, sink EventSink, mgr *Manager) *turn {
 	return &turn{
-		req:            req,
-		sink:           sink,
-		mgr:            mgr,
-		reasoningID:    stableID(req.RunID, "reasoning"),
-		toolStarted:    map[string]bool{},
-		toolEnded:      map[string]bool{},
-		acceptingSteer: true,
+		req:                 req,
+		sink:                sink,
+		mgr:                 mgr,
+		reasoningFallbackID: stableID(req.RunID, "reasoning"),
+		reasoningSegments:   map[string]int{},
+		toolStarted:         map[string]bool{},
+		toolEnded:           map[string]bool{},
+		acceptingSteer:      true,
 	}
 }
 
@@ -162,20 +165,24 @@ func (t *turn) handleUpdate(update acp.SessionUpdate) error {
 	case update.AgentMessageChunk != nil:
 		text := contentBlockText(update.AgentMessageChunk.Content)
 		if text != "" {
+			t.closeActiveReasoning()
 			contentID := t.ensureContent()
 			t.emit("content.delta", map[string]any{"contentId": contentID, "delta": text})
 		}
 	case update.AgentThoughtChunk != nil:
 		text := contentBlockText(update.AgentThoughtChunk.Content)
 		if text != "" {
-			t.ensureReasoning()
-			t.emit("reasoning.delta", map[string]any{"reasoningId": t.reasoningID, "delta": text})
+			reasoningID := t.ensureReasoning(t.reasoningIDForChunk(*update.AgentThoughtChunk))
+			t.emit("reasoning.delta", map[string]any{"reasoningId": reasoningID, "delta": text})
 		}
 	case update.ToolCall != nil:
+		t.closeActiveReasoning()
 		t.handleToolStart(*update.ToolCall)
 	case update.ToolCallUpdate != nil:
+		t.closeActiveReasoning()
 		t.handleToolUpdate(*update.ToolCallUpdate)
 	case update.Plan != nil:
+		t.closeActiveReasoning()
 		eventType := "plan.create"
 		if t.planSeen {
 			eventType = "plan.update"
@@ -209,14 +216,60 @@ func (t *turn) ensureContent() string {
 	return t.contentID
 }
 
-func (t *turn) ensureReasoning() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.reasoningOpen {
-		return
+func (t *turn) ensureReasoning(reasoningID string) string {
+	baseID := strings.TrimSpace(reasoningID)
+	if baseID == "" {
+		baseID = t.reasoningFallbackID
 	}
-	t.reasoningOpen = true
-	t.emit("reasoning.start", map[string]any{"reasoningId": t.reasoningID, "runId": t.req.RunID})
+
+	t.mu.Lock()
+	currentID := t.activeReasoningID
+	currentBase := t.activeReasoningBase
+	if currentID != "" && currentBase == baseID {
+		t.mu.Unlock()
+		return currentID
+	}
+	if t.reasoningSegments == nil {
+		t.reasoningSegments = map[string]int{}
+	}
+	t.reasoningSegments[baseID]++
+	segment := t.reasoningSegments[baseID]
+	nextID := baseID
+	if segment > 1 {
+		nextID = fmt.Sprintf("%s_segment_%d", baseID, segment)
+	}
+	t.activeReasoningBase = baseID
+	t.activeReasoningID = nextID
+	t.mu.Unlock()
+
+	if currentID != "" {
+		t.emit("reasoning.end", map[string]any{"reasoningId": currentID})
+	}
+	t.emit("reasoning.start", map[string]any{"reasoningId": nextID, "runId": t.req.RunID})
+	return nextID
+}
+
+func (t *turn) reasoningIDForChunk(chunk acp.SessionUpdateAgentThoughtChunk) string {
+	if chunk.MessageId != nil && strings.TrimSpace(*chunk.MessageId) != "" {
+		return strings.TrimSpace(*chunk.MessageId)
+	}
+	if chunk.Meta != nil {
+		if itemID := strings.TrimSpace(fmt.Sprint(chunk.Meta["codexItemId"])); itemID != "" && itemID != "<nil>" {
+			return itemID
+		}
+	}
+	return t.reasoningFallbackID
+}
+
+func (t *turn) closeActiveReasoning() {
+	t.mu.Lock()
+	reasoningID := t.activeReasoningID
+	t.activeReasoningID = ""
+	t.activeReasoningBase = ""
+	t.mu.Unlock()
+	if reasoningID != "" {
+		t.emit("reasoning.end", map[string]any{"reasoningId": reasoningID})
+	}
 }
 
 func (t *turn) closeOpenStreams() {
@@ -228,12 +281,12 @@ func (t *turn) closeOpenTextStreams() {
 	t.mu.Lock()
 	contentOpen := t.contentOpen
 	contentID := t.contentID
-	reasoningOpen := t.reasoningOpen
-	reasoningID := t.reasoningID
+	reasoningID := t.activeReasoningID
 	t.contentOpen = false
-	t.reasoningOpen = false
+	t.activeReasoningID = ""
+	t.activeReasoningBase = ""
 	t.mu.Unlock()
-	if reasoningOpen {
+	if reasoningID != "" {
 		t.emit("reasoning.end", map[string]any{"reasoningId": reasoningID})
 	}
 	if contentOpen {

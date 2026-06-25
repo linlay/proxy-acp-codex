@@ -37,6 +37,7 @@ type appServerSession struct {
 	turnDone           chan appTurnResult
 	seenMessageDelta   map[string]bool
 	seenReasoningDelta map[string]bool
+	messagePhases      map[string]string
 	commandOutputs     map[string]*strings.Builder
 	mcpProgress        map[string][]string
 	completedOnStart   map[string]bool
@@ -125,7 +126,7 @@ func (s *appServerSession) startThread(ctx context.Context) error {
 	}
 	params := map[string]any{
 		"cwd":                    s.cwd,
-		"experimentalRawEvents":  false,
+		"experimentalRawEvents":  true,
 		"persistExtendedHistory": false,
 		"ephemeral":              true,
 	}
@@ -169,6 +170,7 @@ func (s *appServerSession) prompt(ctx context.Context, text string) (acp.StopRea
 	s.turnDone = done
 	s.seenMessageDelta = map[string]bool{}
 	s.seenReasoningDelta = map[string]bool{}
+	s.messagePhases = map[string]string{}
 	s.mu.Unlock()
 
 	var response struct {
@@ -266,8 +268,13 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 			Delta  string `json:"delta"`
 		}
 		if json.Unmarshal(params, &payload) == nil && payload.Delta != "" {
-			s.markMessageDelta(payload.ItemID)
-			s.sendUpdate(acp.UpdateAgentMessageText(payload.Delta))
+			if isCommentaryAgentMessagePhase(s.messagePhase(payload.ItemID)) {
+				s.markReasoningDelta(payload.ItemID)
+				s.sendThoughtText(payload.ItemID, payload.Delta)
+			} else {
+				s.markMessageDelta(payload.ItemID)
+				s.sendUpdate(acp.UpdateAgentMessageText(payload.Delta))
+			}
 		}
 	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta":
 		var payload struct {
@@ -276,7 +283,7 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 		}
 		if json.Unmarshal(params, &payload) == nil && payload.Delta != "" {
 			s.markReasoningDelta(payload.ItemID)
-			s.sendUpdate(acp.UpdateAgentThoughtText(payload.Delta))
+			s.sendThoughtText(payload.ItemID, payload.Delta)
 		}
 	case "item/started":
 		var payload struct {
@@ -352,6 +359,8 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 
 func (s *appServerSession) handleStartedItem(item appServerItem, raw map[string]any) {
 	switch item.Type {
+	case "agentMessage":
+		s.setMessagePhase(item.ID, item.Phase)
 	case "fileChange", "commandExecution", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration":
 		opts := []acp.ToolCallStartOpt{
 			acp.WithStartKind(itemToolKind(item)),
@@ -375,6 +384,13 @@ func (s *appServerSession) handleStartedItem(item appServerItem, raw map[string]
 func (s *appServerSession) handleCompletedItem(item appServerItem, raw map[string]any) {
 	switch item.Type {
 	case "agentMessage":
+		s.setMessagePhase(item.ID, item.Phase)
+		if isCommentaryAgentMessagePhase(item.Phase) {
+			if item.Text != "" && !s.hasReasoningDelta(item.ID) {
+				s.sendThoughtText(item.ID, item.Text)
+			}
+			return
+		}
 		if item.Text != "" && !s.hasMessageDelta(item.ID) {
 			s.sendUpdate(acp.UpdateAgentMessageText(item.Text))
 		}
@@ -382,7 +398,7 @@ func (s *appServerSession) handleCompletedItem(item appServerItem, raw map[strin
 		if !s.hasReasoningDelta(item.ID) {
 			text := strings.Join(append(item.Summary, item.Content...), "\n")
 			if text != "" {
-				s.sendUpdate(acp.UpdateAgentThoughtText(text))
+				s.sendThoughtText(item.ID, text)
 			}
 		}
 	case "fileChange", "commandExecution", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration":
@@ -653,6 +669,25 @@ func (s *appServerSession) sendUpdate(update acp.SessionUpdate) {
 	})
 }
 
+func (s *appServerSession) sendThoughtText(itemID string, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	update := acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock(text),
+			SessionUpdate: "agent_thought_chunk",
+		},
+	}
+	if strings.TrimSpace(itemID) != "" {
+		update.AgentThoughtChunk.MessageId = &itemID
+		update.AgentThoughtChunk.Meta = map[string]any{
+			"codexItemId": itemID,
+		}
+	}
+	s.sendUpdate(update)
+}
+
 func (s *appServerSession) setActiveTurnID(turnID string) {
 	s.mu.Lock()
 	if s.turnDone != nil && s.activeTurnID == "" {
@@ -709,6 +744,26 @@ func (s *appServerSession) hasMessageDelta(itemID string) bool {
 	return s.seenMessageDelta[itemID]
 }
 
+func (s *appServerSession) setMessagePhase(itemID string, phase string) {
+	itemID = strings.TrimSpace(itemID)
+	phase = strings.TrimSpace(phase)
+	if itemID == "" || phase == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.messagePhases == nil {
+		s.messagePhases = map[string]string{}
+	}
+	s.messagePhases[itemID] = phase
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) messagePhase(itemID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.messagePhases[strings.TrimSpace(itemID)])
+}
+
 func (s *appServerSession) markReasoningDelta(itemID string) {
 	s.mu.Lock()
 	if s.seenReasoningDelta == nil {
@@ -722,6 +777,10 @@ func (s *appServerSession) hasReasoningDelta(itemID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.seenReasoningDelta[itemID]
+}
+
+func isCommentaryAgentMessagePhase(phase string) bool {
+	return strings.TrimSpace(phase) == "commentary"
 }
 
 func (s *appServerSession) appendCommandOutput(itemID string, delta string) {
@@ -815,6 +874,7 @@ type appServerItem struct {
 	Type             string           `json:"type"`
 	ID               string           `json:"id"`
 	Text             string           `json:"text"`
+	Phase            string           `json:"phase"`
 	Summary          []string         `json:"summary"`
 	Content          []string         `json:"content"`
 	Status           string           `json:"status"`

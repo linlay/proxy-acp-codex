@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -112,6 +113,125 @@ func TestManagerExecuteMapsACPUpdatesToPlatformEvents(t *testing.T) {
 	}
 	if got := events[len(events)-1].Type; got != "run.complete" {
 		t.Fatalf("last event = %s, want run.complete", got)
+	}
+}
+
+func TestTurnSplitsReasoningByThoughtMessageID(t *testing.T) {
+	m := NewManager(config.Config{})
+	defer m.Close()
+
+	sink := &recordingSink{}
+	turn := newTurn(platform.QueryRequest{
+		RunID:    "run_reasoning",
+		ChatID:   "chat_reasoning",
+		AgentKey: "fake",
+	}, sink, m)
+
+	id1 := "reasoning_item_1"
+	id2 := "reasoning_item_2"
+	if err := turn.handleUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock("first"),
+			MessageId:     &id1,
+			SessionUpdate: "agent_thought_chunk",
+		},
+	}); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	if err := turn.handleUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock("second"),
+			MessageId:     &id2,
+			SessionUpdate: "agent_thought_chunk",
+		},
+	}); err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+	turn.closeOpenTextStreams()
+
+	events := sink.snapshot()
+	if got, want := eventTypes(events), []string{
+		"reasoning.start",
+		"reasoning.delta",
+		"reasoning.end",
+		"reasoning.start",
+		"reasoning.delta",
+		"reasoning.end",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("event types = %#v, want %#v", got, want)
+	}
+	if got, _ := events[0].Payload["reasoningId"].(string); got != id1 {
+		t.Fatalf("first reasoning id = %q, want %q", got, id1)
+	}
+	if got, _ := events[2].Payload["reasoningId"].(string); got != id1 {
+		t.Fatalf("first reasoning end id = %q, want %q", got, id1)
+	}
+	if got, _ := events[3].Payload["reasoningId"].(string); got != id2 {
+		t.Fatalf("second reasoning id = %q, want %q", got, id2)
+	}
+	if got, _ := events[5].Payload["reasoningId"].(string); got != id2 {
+		t.Fatalf("second reasoning end id = %q, want %q", got, id2)
+	}
+}
+
+func TestTurnAutoSegmentsReasoningAroundToolUse(t *testing.T) {
+	m := NewManager(config.Config{})
+	defer m.Close()
+
+	sink := &recordingSink{}
+	turn := newTurn(platform.QueryRequest{
+		RunID:    "run_reasoning_tool",
+		ChatID:   "chat_reasoning_tool",
+		AgentKey: "fake",
+	}, sink, m)
+
+	reasoningID := "reasoning_item_1"
+	if err := turn.handleUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock("before tool"),
+			MessageId:     &reasoningID,
+			SessionUpdate: "agent_thought_chunk",
+		},
+	}); err != nil {
+		t.Fatalf("first reasoning update: %v", err)
+	}
+	if err := turn.handleUpdate(acp.SessionUpdate{
+		ToolCall: &acp.SessionUpdateToolCall{
+			ToolCallId: "tool_1",
+			Title:      "Run command",
+			Kind:       acp.ToolKindExecute,
+		},
+	}); err != nil {
+		t.Fatalf("tool update: %v", err)
+	}
+	if err := turn.handleUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock("after tool"),
+			MessageId:     &reasoningID,
+			SessionUpdate: "agent_thought_chunk",
+		},
+	}); err != nil {
+		t.Fatalf("second reasoning update: %v", err)
+	}
+	turn.closeOpenTextStreams()
+
+	events := sink.snapshot()
+	if got, want := eventTypes(events), []string{
+		"reasoning.start",
+		"reasoning.delta",
+		"reasoning.end",
+		"tool.start",
+		"reasoning.start",
+		"reasoning.delta",
+		"reasoning.end",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("event types = %#v, want %#v", got, want)
+	}
+	if got, _ := events[0].Payload["reasoningId"].(string); got != reasoningID {
+		t.Fatalf("first segment id = %q, want %q", got, reasoningID)
+	}
+	if got, _ := events[4].Payload["reasoningId"].(string); got != reasoningID+"_segment_2" {
+		t.Fatalf("second segment id = %q, want %q", got, reasoningID+"_segment_2")
 	}
 }
 

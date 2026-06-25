@@ -247,6 +247,9 @@ func TestAppServerSessionStreamsDeltasAndSuppressesCompletedDuplicate(t *testing
 	if got, want := peer.thoughts, []string{"thinking"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("thoughts = %#v, want %#v", got, want)
 	}
+	if got, want := peer.thoughtMessageIDs, []string{"reason_1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thought message ids = %#v, want %#v", got, want)
+	}
 }
 
 func TestAppServerThreadStartIncludesModelAndAccessOptions(t *testing.T) {
@@ -287,6 +290,9 @@ func TestAppServerThreadStartIncludesModelAndAccessOptions(t *testing.T) {
 	if threadStart["model"] != "gpt-5-codex" || threadStart["approvalPolicy"] != "never" || threadStart["sandbox"] != "danger-full-access" {
 		t.Fatalf("thread/start params = %#v", threadStart)
 	}
+	if threadStart["experimentalRawEvents"] != true {
+		t.Fatalf("thread/start experimentalRawEvents = %#v, want true", threadStart["experimentalRawEvents"])
+	}
 	config, ok := threadStart["config"].(map[string]any)
 	if !ok || config["model_reasoning_effort"] != "high" {
 		t.Fatalf("thread/start config = %#v", threadStart["config"])
@@ -307,6 +313,39 @@ func TestAppServerCompletedItemFallback(t *testing.T) {
 	session.handleNotification("item/completed", []byte(`{"item":{"type":"agentMessage","id":"item_1","text":"duplicate"}}`))
 	if len(peer.messages) != 0 {
 		t.Fatalf("messages = %#v, want no duplicate", peer.messages)
+	}
+
+	peer = &fakePeer{}
+	session = &appServerSession{sessionID: "sess_test", conn: peer}
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"reasoning","id":"reason_2","summary":["plan"],"content":["detail"]}}`))
+	if got, want := peer.thoughts, []string{"plan\ndetail"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thoughts = %#v, want %#v", got, want)
+	}
+	if got, want := peer.thoughtMessageIDs, []string{"reason_2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thought message ids = %#v, want %#v", got, want)
+	}
+}
+
+func TestAppServerAgentMessagePhaseRoutesCommentaryToThoughts(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/started", []byte(`{"item":{"type":"agentMessage","id":"msg_commentary","phase":"commentary","text":""}}`))
+	session.handleNotification("item/agentMessage/delta", []byte(`{"itemId":"msg_commentary","delta":"I will inspect first."}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"agentMessage","id":"msg_commentary","phase":"commentary","text":"duplicate commentary"}}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"agentMessage","id":"msg_commentary_done","phase":"commentary","text":"fallback commentary"}}`))
+	session.handleNotification("item/started", []byte(`{"item":{"type":"agentMessage","id":"msg_final","phase":"final_answer","text":""}}`))
+	session.handleNotification("item/agentMessage/delta", []byte(`{"itemId":"msg_final","delta":"Final answer."}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"agentMessage","id":"msg_final","phase":"final_answer","text":"duplicate final"}}`))
+
+	if got, want := peer.thoughts, []string{"I will inspect first.", "fallback commentary"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thoughts = %#v, want %#v", got, want)
+	}
+	if got, want := peer.thoughtMessageIDs, []string{"msg_commentary", "msg_commentary_done"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thought message ids = %#v, want %#v", got, want)
+	}
+	if got, want := peer.messages, []string{"Final answer."}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("messages = %#v, want %#v", got, want)
 	}
 }
 
@@ -639,6 +678,7 @@ type fakePeer struct {
 	mu                 sync.Mutex
 	messages           []string
 	thoughts           []string
+	thoughtMessageIDs  []string
 	toolStarts         []acp.SessionUpdateToolCall
 	toolUpdates        []acp.SessionToolCallUpdate
 	plans              []acp.SessionUpdatePlan
@@ -655,6 +695,11 @@ func (f *fakePeer) SessionUpdate(_ context.Context, params acp.SessionNotificati
 	}
 	if params.Update.AgentThoughtChunk != nil {
 		f.thoughts = append(f.thoughts, contentText(params.Update.AgentThoughtChunk.Content))
+		if params.Update.AgentThoughtChunk.MessageId != nil {
+			f.thoughtMessageIDs = append(f.thoughtMessageIDs, *params.Update.AgentThoughtChunk.MessageId)
+		} else {
+			f.thoughtMessageIDs = append(f.thoughtMessageIDs, "")
+		}
 	}
 	if params.Update.ToolCall != nil {
 		f.toolStarts = append(f.toolStarts, *params.Update.ToolCall)
