@@ -168,6 +168,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			go s.wsQuery(connCtx, conn, frame)
 		case "request.submit", "/api/submit":
 			s.wsSubmit(conn, frame)
+		case "request.access-level", "/api/access-level":
+			s.wsAccessLevel(conn, frame)
 		case "request.steer", "/api/steer":
 			s.wsSteer(conn, frame)
 		case "request.interrupt", "/api/interrupt":
@@ -201,6 +203,16 @@ func (s *Server) wsSubmit(conn *websocket.Conn, frame requestFrame) {
 		return
 	}
 	resp, _ := s.manager.Submit(req)
+	writeWS(conn, responseFrame{Frame: "response", Type: frame.Type, ID: frame.ID, Code: 0, Msg: "success", Data: resp})
+}
+
+func (s *Server) wsAccessLevel(conn *websocket.Conn, frame requestFrame) {
+	req, err := platform.DecodeJSON[platform.AccessLevelRequest](frame.Payload)
+	if err != nil || strings.TrimSpace(req.RunID) == "" || strings.TrimSpace(req.AccessLevel) == "" {
+		writeWS(conn, errorFrame{Frame: "error", ID: frame.ID, Type: "invalid_request", Code: 400, Msg: "invalid access-level payload"})
+		return
+	}
+	resp, _ := s.manager.UpdateAccessLevel(req)
 	writeWS(conn, responseFrame{Frame: "response", Type: frame.Type, ID: frame.ID, Code: 0, Msg: "success", Data: resp})
 }
 

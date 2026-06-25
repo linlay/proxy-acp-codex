@@ -3,6 +3,7 @@ package codexacp
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1237,19 +1238,32 @@ func resultFromTurn(turn appServerTurn) (appTurnResult, bool) {
 }
 
 func commandPermissionOptions(raw any) []acp.PermissionOption {
-	decisions := decisionStrings(raw)
+	decisions := decisionValues(raw)
 	if len(decisions) == 0 {
-		decisions = []string{"accept", "acceptForSession", "decline"}
+		decisions = []any{"accept", "acceptForSession", "decline"}
 	}
 	options := make([]acp.PermissionOption, 0, len(decisions))
 	for _, decision := range decisions {
-		switch decision {
-		case "accept":
-			options = append(options, acp.PermissionOption{OptionId: "accept", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce})
-		case "acceptForSession":
-			options = append(options, acp.PermissionOption{OptionId: "acceptForSession", Name: "Allow for session", Kind: acp.PermissionOptionKindAllowAlways})
-		case "decline", "cancel":
-			options = append(options, acp.PermissionOption{OptionId: acp.PermissionOptionId(decision), Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce})
+		switch typed := decision.(type) {
+		case string:
+			switch typed {
+			case "accept":
+				options = append(options, acp.PermissionOption{OptionId: "accept", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce})
+			case "acceptForSession":
+				options = append(options, acp.PermissionOption{OptionId: "acceptForSession", Name: "Allow for session", Kind: acp.PermissionOptionKindAllowAlways})
+			case "decline", "cancel":
+				options = append(options, acp.PermissionOption{OptionId: acp.PermissionOptionId(typed), Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce})
+			}
+		case map[string]any:
+			optionID := encodedDecisionOptionID(typed)
+			if optionID == "" {
+				continue
+			}
+			options = append(options, acp.PermissionOption{
+				OptionId: acp.PermissionOptionId(optionID),
+				Name:     "Allow once",
+				Kind:     acp.PermissionOptionKindAllowOnce,
+			})
 		}
 	}
 	if len(options) == 0 {
@@ -1258,18 +1272,56 @@ func commandPermissionOptions(raw any) []acp.PermissionOption {
 	return options
 }
 
-func decisionStrings(raw any) []string {
+func decisionValues(raw any) []any {
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		if value, ok := item.(string); ok {
-			out = append(out, value)
+	return items
+}
+
+func encodedDecisionOptionID(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return "decision_json:" + base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeDecisionOptionID(id string) (any, bool) {
+	encoded, ok := strings.CutPrefix(strings.TrimSpace(id), "decision_json:")
+	if !ok || encoded == "" {
+		return nil, false
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, false
+	}
+	var payload any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+func commandDecisionFromOutcome(outcome acp.RequestPermissionOutcome) any {
+	if outcome.Selected != nil {
+		if payload, ok := decodeDecisionOptionID(string(outcome.Selected.OptionId)); ok {
+			return payload
+		}
+		switch outcome.Selected.OptionId {
+		case "accept":
+			return "accept"
+		case "acceptForSession":
+			return "acceptForSession"
+		case "decline", "cancel":
+			return string(outcome.Selected.OptionId)
 		}
 	}
-	return out
+	return "cancel"
 }
 
 func questionPermissionOptions() []acp.PermissionOption {
@@ -1442,16 +1494,6 @@ func cloneAnyMap(in map[string]any) map[string]any {
 		out[key] = value
 	}
 	return out
-}
-
-func commandDecisionFromOutcome(outcome acp.RequestPermissionOutcome) any {
-	if outcome.Selected != nil {
-		switch outcome.Selected.OptionId {
-		case "accept", "acceptForSession", "decline", "cancel":
-			return string(outcome.Selected.OptionId)
-		}
-	}
-	return "cancel"
 }
 
 func fileDecisionFromOutcome(outcome acp.RequestPermissionOutcome) string {

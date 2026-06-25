@@ -116,6 +116,53 @@ func TestManagerExecuteMapsACPUpdatesToPlatformEvents(t *testing.T) {
 	}
 }
 
+func TestPermissionApprovalsFormatsCommandAndExecpolicyOption(t *testing.T) {
+	tool := acp.ToolCallUpdate{
+		ToolCallId: "cmd_1",
+		RawInput: map[string]any{
+			"command": "cat /Users/joe/live_full_access_probe2.txt",
+			"reason":  "Write the requested probe file outside the workspace and verify its contents.",
+		},
+	}
+	options := []acp.PermissionOption{
+		{OptionId: "accept", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "decision_json:abc", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "decline", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+	}
+
+	approvals := permissionApprovals(tool, options)
+	if len(approvals) != 1 {
+		t.Fatalf("approvals len = %d, want 1", len(approvals))
+	}
+	approval := approvals[0]
+	if got := approval["command"]; got != "cat /Users/joe/live_full_access_probe2.txt" {
+		t.Fatalf("command = %#v", got)
+	}
+	if got := approval["description"]; got != "Write the requested probe file outside the workspace and verify its contents." {
+		t.Fatalf("description = %#v", got)
+	}
+	rawOptions, _ := approval["options"].([]map[string]any)
+	if len(rawOptions) != 1 {
+		t.Fatalf("options len = %d, want 1", len(rawOptions))
+	}
+	if got := rawOptions[0]["decision"]; got != "approve" {
+		t.Fatalf("first decision = %#v, want approve", got)
+	}
+}
+
+func TestPermissionOutcomeFromSubmitApprovePrefersExecpolicyAmendment(t *testing.T) {
+	outcome := permissionOutcomeFromSubmit([]map[string]any{{
+		"id":       "cmd_2",
+		"decision": "approve",
+	}}, []acp.PermissionOption{
+		{OptionId: "accept", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "decision_json:abc", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+	})
+	if outcome.Selected == nil || outcome.Selected.OptionId != "decision_json:abc" {
+		t.Fatalf("outcome = %#v, want decision_json:abc", outcome)
+	}
+}
+
 func TestTurnSplitsReasoningByThoughtMessageID(t *testing.T) {
 	m := NewManager(config.Config{})
 	defer m.Close()
@@ -500,6 +547,17 @@ func TestPermissionOutcomeRuleDecisionOverridesCollapsedApprovalID(t *testing.T)
 	}
 }
 
+func TestPermissionOutcomeFullAccessPrefersExecpolicyAmendment(t *testing.T) {
+	outcome := permissionOutcomeFromAccessLevel("full_access", []acp.PermissionOption{
+		{OptionId: "accept", Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: acp.PermissionOptionId("decision_json:abc"), Name: "Allow once", Kind: acp.PermissionOptionKindAllowOnce},
+		{OptionId: "decline", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+	})
+	if outcome.Selected == nil || outcome.Selected.OptionId != "decision_json:abc" {
+		t.Fatalf("outcome = %#v, want decision_json:abc", outcome)
+	}
+}
+
 func TestPermissionApprovalsCollapseRejectOption(t *testing.T) {
 	title := "Run command"
 	approvals := permissionApprovals(acp.ToolCallUpdate{
@@ -516,14 +574,11 @@ func TestPermissionApprovalsCollapseRejectOption(t *testing.T) {
 	if !ok {
 		t.Fatalf("approval options = %#v", approvals[0]["options"])
 	}
-	if len(options) != 2 {
-		t.Fatalf("approval options = %#v, want allow + reject", options)
+	if len(options) != 1 {
+		t.Fatalf("approval options = %#v, want allow only", options)
 	}
-	if options[0]["decision"] != "approve" || options[0]["label"] != "Allow once" {
-		t.Fatalf("first option = %#v, want Allow once approve", options[0])
-	}
-	if options[1]["decision"] != "reject" || options[1]["label"] != "Reject" {
-		t.Fatalf("second option = %#v, want Reject", options[1])
+	if options[0]["decision"] != "approve" || options[0]["label"] != "同意" {
+		t.Fatalf("first option = %#v, want normalized approve option", options[0])
 	}
 }
 

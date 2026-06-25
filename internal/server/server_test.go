@@ -330,6 +330,68 @@ func TestQueryWebSocketSubmitAndSteer(t *testing.T) {
 	)
 }
 
+func TestQueryWebSocketAccessLevelResolvesPendingApproval(t *testing.T) {
+	cfg := testConfig(t)
+	manager := acpbridge.NewManager(cfg)
+	defer manager.Close()
+	handler := New(cfg, manager)
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	conn, _, err := gws.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	var connected map[string]any
+	if err := conn.ReadJSON(&connected); err != nil {
+		t.Fatalf("read connected frame: %v", err)
+	}
+
+	root := repoRoot(t)
+	queryPayload := fmt.Sprintf(`{"requestId":"req_access_ws","runId":"run_access_ws","chatId":"chat_access_ws","agentKey":"fake","message":"needs permission","accessLevel":"default","params":{"cwd":%q}}`, root)
+	if err := conn.WriteJSON(requestFrame{Frame: "request", Type: "request.query", ID: "req_access_ws", Payload: json.RawMessage(queryPayload)}); err != nil {
+		t.Fatalf("write websocket query: %v", err)
+	}
+
+	awaitingSeen := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		frame := readWSFrame(t, conn)
+		if frame.Event != nil && frame.Event.Type == "awaiting.ask" {
+			awaitingSeen = true
+			break
+		}
+	}
+	if !awaitingSeen {
+		t.Fatalf("expected awaiting.ask")
+	}
+
+	accessPayload := `{"runId":"run_access_ws","accessLevel":"auto_approve"}`
+	if err := conn.WriteJSON(requestFrame{Frame: "request", Type: "request.access-level", ID: "access_ws", Payload: json.RawMessage(accessPayload)}); err != nil {
+		t.Fatalf("write websocket access-level: %v", err)
+	}
+
+	accessResponseSeen := false
+	done := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		frame := readWSFrame(t, conn)
+		if frame.Frame == "response" && frame.ID == "access_ws" {
+			accessResponseSeen = true
+			continue
+		}
+		if frame.Frame == "stream" && frame.Reason == "done" {
+			done = true
+			break
+		}
+	}
+	if !accessResponseSeen || !done {
+		t.Fatalf("expected access-level response and done stream, response=%v done=%v", accessResponseSeen, done)
+	}
+}
+
 type testWSFrame struct {
 	Frame  string              `json:"frame"`
 	ID     string              `json:"id"`

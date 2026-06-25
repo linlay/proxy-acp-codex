@@ -412,6 +412,32 @@ func TestAppServerCommandApprovalMapsToACPPermission(t *testing.T) {
 	}
 }
 
+func TestAppServerCommandApprovalPreservesExecpolicyAmendmentDecision(t *testing.T) {
+	optionID := encodedDecisionOptionID(map[string]any{
+		"acceptWithExecpolicyAmendment": map[string]any{
+			"execpolicy_amendment": []any{"/bin/zsh", "-lc", "touch /Users/joe/test.txt"},
+		},
+	})
+	peer := &fakePeer{permissionResponse: selectedPermission(optionID)}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	result, err := session.handleCommandApproval([]byte(`{"itemId":"cmd_2","command":"touch /Users/joe/test.txt","availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["/bin/zsh","-lc","touch /Users/joe/test.txt"]}},"decline"]}`))
+	if err != nil {
+		t.Fatalf("approval: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result = %#v", result)
+	}
+	decision, ok := payload["decision"].(map[string]any)
+	if !ok {
+		t.Fatalf("decision = %#v", payload["decision"])
+	}
+	if _, ok := decision["acceptWithExecpolicyAmendment"]; !ok {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
 func TestAppServerRequestUserInputMapsToACPQuestion(t *testing.T) {
 	peer := &fakePeer{permissionResponse: selectedQuestionPermission([]map[string]any{
 		{"id": "hitl_status", "answer": "已触发"},

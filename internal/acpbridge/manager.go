@@ -424,10 +424,28 @@ func accessLevelAllowsAutoApproval(accessLevel string) bool {
 }
 
 func permissionOutcomeFromAccessLevel(accessLevel string, options []acp.PermissionOption) acp.RequestPermissionOutcome {
-	if !accessLevelAllowsAutoApproval(accessLevel) {
+	switch normalizeAccessLevel(accessLevel) {
+	case "":
+		return acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}
+	case "full_access":
+		if id := permissionOptionIDByPrefix(options, "decision_json:"); id != "" {
+			return acp.RequestPermissionOutcome{Selected: &acp.RequestPermissionOutcomeSelected{OptionId: acp.PermissionOptionId(id)}}
+		}
+		return permissionOutcomeFromSubmit([]map[string]any{{"decision": "approve"}}, options)
+	case "auto_approve":
+		return permissionOutcomeFromSubmit([]map[string]any{{"decision": "approve_rule_run"}}, options)
+	default:
 		return acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}
 	}
-	return permissionOutcomeFromSubmit([]map[string]any{{"decision": "approve_rule_run"}}, options)
+}
+
+func permissionOptionIDByPrefix(options []acp.PermissionOption, prefix string) string {
+	for _, option := range options {
+		if strings.HasPrefix(string(option.OptionId), prefix) {
+			return string(option.OptionId)
+		}
+	}
+	return ""
 }
 
 func backendArgsWithModel(base []string, model string) []string {

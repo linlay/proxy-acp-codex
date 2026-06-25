@@ -14,6 +14,8 @@ import (
 	"proxy-acp-codex/internal/platform"
 )
 
+const approvalOptionJSONPrefix = "decision_json:"
+
 type turn struct {
 	req  platform.QueryRequest
 	sink EventSink
@@ -550,6 +552,14 @@ func firstNonBlank(values ...string) string {
 }
 
 func permissionCommand(update acp.ToolCallUpdate) string {
+	if payload, ok := update.RawInput.(map[string]any); ok {
+		if command := strings.TrimSpace(permissionRawString(payload["command"])); command != "" {
+			return command
+		}
+		if reason := strings.TrimSpace(permissionRawString(payload["reason"])); reason != "" {
+			return reason
+		}
+	}
 	if update.RawInput != nil {
 		return marshalAny(update.RawInput)
 	}
@@ -559,48 +569,31 @@ func permissionCommand(update acp.ToolCallUpdate) string {
 	return string(update.ToolCallId)
 }
 
-func decisionForOption(kind acp.PermissionOptionKind) string {
-	switch kind {
-	case acp.PermissionOptionKindAllowAlways:
-		return "approve_rule_run"
-	case acp.PermissionOptionKindAllowOnce:
-		return "approve"
-	default:
-		return "reject"
-	}
-}
-
 func permissionApprovals(tool acp.ToolCallUpdate, options []acp.PermissionOption) []map[string]any {
-	approvalOptions := make([]map[string]any, 0, len(options)+1)
-	description := ""
+	approvalOptions := make([]map[string]any, 0, 1)
 	id := ""
 	for _, option := range options {
-		decision := decisionForOption(option.Kind)
+		label, decision, meta := approvalOptionPresentation(option)
 		if decision == "reject" {
 			continue
 		}
 		if id == "" {
 			id = string(option.OptionId)
 		}
-		if description == "" {
-			description = option.Name
+		entry := map[string]any{"label": label, "decision": decision}
+		if meta != "" {
+			entry["description"] = meta
 		}
-		approvalOptions = append(approvalOptions, map[string]any{
-			"label":    option.Name,
-			"decision": decision,
-		})
+		approvalOptions = append(approvalOptions, entry)
+		break
 	}
 	if id == "" && len(options) > 0 {
 		id = string(options[0].OptionId)
 	}
-	if description == "" {
-		description = "Approval required"
-	}
-	approvalOptions = append(approvalOptions, map[string]any{"label": "Reject", "decision": "reject"})
 	return []map[string]any{{
 		"id":            id,
 		"command":       permissionCommand(tool),
-		"description":   description,
+		"description":   permissionDescription(tool),
 		"options":       approvalOptions,
 		"allowFreeText": true,
 	}}
@@ -614,6 +607,11 @@ func permissionOutcomeFromSubmit(params []map[string]any, options []acp.Permissi
 	id, _ := params[0]["id"].(string)
 	if strings.HasPrefix(strings.ToLower(decision), "reject") {
 		return acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}
+	}
+	if strings.EqualFold(decision, "approve") {
+		if optionID := permissionOptionIDByPrefix(options, approvalOptionJSONPrefix); optionID != "" {
+			id = optionID
+		}
 	}
 	if strings.EqualFold(decision, "approve_rule_run") || strings.EqualFold(decision, "approve_rule_session") {
 		if optionID := permissionOptionIDByKind(options, acp.PermissionOptionKindAllowAlways); optionID != "" {
@@ -647,6 +645,55 @@ func permissionOptionIDByKind(options []acp.PermissionOption, kind acp.Permissio
 		}
 	}
 	return ""
+}
+
+func permissionDescription(tool acp.ToolCallUpdate) string {
+	if payload, ok := tool.RawInput.(map[string]any); ok {
+		if reason := strings.TrimSpace(permissionRawString(payload["reason"])); reason != "" {
+			return reason
+		}
+	}
+	if tool.Title != nil {
+		title := strings.TrimSpace(*tool.Title)
+		title = strings.TrimPrefix(title, "Run command: ")
+		if title != "" {
+			return "Command execution requires approval"
+		}
+	}
+	return "Approval required"
+}
+
+func approvalOptionPresentation(option acp.PermissionOption) (label string, decision string, description string) {
+	switch {
+	case strings.HasPrefix(string(option.OptionId), approvalOptionJSONPrefix):
+		return "同意", "approve", "允许执行当前命令"
+	case option.Kind == acp.PermissionOptionKindAllowAlways:
+		return "同意", "approve", "允许执行当前命令"
+	case option.Kind == acp.PermissionOptionKindAllowOnce:
+		return "同意", "approve", "允许执行当前命令"
+	default:
+		return option.Name, "reject", ""
+	}
+}
+
+func permissionRawString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []string:
+		return strings.Join(typed, " ")
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			part := strings.TrimSpace(fmt.Sprint(item))
+			if part != "" {
+				parts = append(parts, part)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
+	}
 }
 
 func questionPayload(raw any) []map[string]any {
