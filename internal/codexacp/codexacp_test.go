@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/coder/acp-go-sdk"
+
+	"proxy-acp-codex/internal/platform"
 )
 
 func TestParseLineCapturesThreadID(t *testing.T) {
@@ -234,7 +236,7 @@ func TestAppServerSessionStreamsDeltasAndSuppressesCompletedDuplicate(t *testing
 	}
 	defer session.close()
 
-	stop, err := session.prompt(context.Background(), "say hello")
+	stop, err := session.prompt(context.Background(), "say hello", nil)
 	if err != nil {
 		t.Fatalf("prompt: %v", err)
 	}
@@ -296,6 +298,57 @@ func TestAppServerThreadStartIncludesModelAndAccessOptions(t *testing.T) {
 	config, ok := threadStart["config"].(map[string]any)
 	if !ok || config["model_reasoning_effort"] != "high" {
 		t.Fatalf("thread/start config = %#v", threadStart["config"])
+	}
+}
+
+func TestAppServerPromptSendsPlanningCollaborationMode(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "params.log")
+	fakeCodex := writeAppServerHelper(t, dir)
+	t.Setenv("FAKE_APP_SERVER_LOG", logPath)
+	t.Setenv("FAKE_APP_SERVER_LOG_PARAMS", "1")
+
+	session, err := startAppServerSession(context.Background(), fakeCodex, nil, codexRuntimeOptions{
+		model: "gpt-5-codex",
+	}, dir, acp.SessionId("sess_test"), &fakePeer{})
+	if err != nil {
+		t.Fatalf("start app-server session: %v", err)
+	}
+	defer session.close()
+
+	enabled := true
+	if _, err := session.prompt(context.Background(), "plan first", &enabled); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var turnStart map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		method, raw, ok := strings.Cut(line, " ")
+		if !ok || method != "turn/start" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(raw), &turnStart); err != nil {
+			t.Fatalf("decode turn/start params: %v", err)
+		}
+		break
+	}
+	if turnStart == nil {
+		t.Fatalf("turn/start params not logged: %q", data)
+	}
+	mode, ok := turnStart["collaborationMode"].(map[string]any)
+	if !ok {
+		t.Fatalf("collaborationMode = %#v", turnStart["collaborationMode"])
+	}
+	if mode["mode"] != "plan" {
+		t.Fatalf("collaboration mode = %#v", mode)
+	}
+	settings, ok := mode["settings"].(map[string]any)
+	if !ok || settings["model"] != "gpt-5-codex" || settings["reasoning_effort"] != "medium" {
+		t.Fatalf("settings = %#v", mode["settings"])
 	}
 }
 
@@ -365,7 +418,7 @@ func TestAppServerCancelSendsInterrupt(t *testing.T) {
 
 	result := make(chan appTurnResult, 1)
 	go func() {
-		stop, err := session.prompt(context.Background(), "wait")
+		stop, err := session.prompt(context.Background(), "wait", nil)
 		result <- appTurnResult{stop: stop, err: err}
 	}()
 	waitForActiveTurn(t, session)
@@ -629,6 +682,29 @@ func TestAppServerCoreItemEventsMapToACPUpdates(t *testing.T) {
 	}
 }
 
+func TestAppServerPlanItemDeltaMapsToInternalPlanningEvents(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{sessionID: "sess_test", conn: peer}
+
+	session.handleNotification("item/started", []byte(`{"item":{"type":"plan","id":"plan_item_1","text":""}}`))
+	session.handleNotification("item/plan/delta", []byte(`{"itemId":"plan_item_1","delta":"Step one"}`))
+	session.handleNotification("item/completed", []byte(`{"item":{"type":"plan","id":"plan_item_1","text":"Step one"}}`))
+
+	if got, want := peer.thoughts, []string{"", "Step one", ""}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("thought chunks = %#v, want %#v", got, want)
+	}
+	if len(peer.thoughtMetas) != 3 {
+		t.Fatalf("thought metas = %#v", peer.thoughtMetas)
+	}
+	wantTypes := []string{"planning.start", "planning.delta", "planning.end"}
+	for idx, wantType := range wantTypes {
+		if peer.thoughtMetas[idx][platform.ACPMetaEventType] != wantType ||
+			peer.thoughtMetas[idx][platform.ACPMetaPlanningID] != "plan_item_1" {
+			t.Fatalf("meta[%d] = %#v", idx, peer.thoughtMetas[idx])
+		}
+	}
+}
+
 func TestAppServerImageViewDoesNotEmitDuplicateCompletion(t *testing.T) {
 	peer := &fakePeer{}
 	session := &appServerSession{sessionID: "sess_test", conn: peer}
@@ -705,6 +781,7 @@ type fakePeer struct {
 	messages           []string
 	thoughts           []string
 	thoughtMessageIDs  []string
+	thoughtMetas       []map[string]any
 	toolStarts         []acp.SessionUpdateToolCall
 	toolUpdates        []acp.SessionToolCallUpdate
 	plans              []acp.SessionUpdatePlan
@@ -721,6 +798,7 @@ func (f *fakePeer) SessionUpdate(_ context.Context, params acp.SessionNotificati
 	}
 	if params.Update.AgentThoughtChunk != nil {
 		f.thoughts = append(f.thoughts, contentText(params.Update.AgentThoughtChunk.Content))
+		f.thoughtMetas = append(f.thoughtMetas, params.Update.AgentThoughtChunk.Meta)
 		if params.Update.AgentThoughtChunk.MessageId != nil {
 			f.thoughtMessageIDs = append(f.thoughtMessageIDs, *params.Update.AgentThoughtChunk.MessageId)
 		} else {
@@ -833,7 +911,12 @@ func runFakeAppServer() {
 		case "initialize":
 			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"userAgent": "fake", "codexHome": "/tmp", "platformFamily": "unix", "platformOs": "macos"}})
 		case "thread/start":
-			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"thread": map[string]any{"id": "thread_1"}}})
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"thread": map[string]any{"id": "thread_1"}, "model": "gpt-5-codex", "reasoningEffort": "medium"}})
+		case "collaborationMode/list":
+			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"data": []map[string]any{
+				{"name": "Plan", "mode": "plan", "model": nil, "reasoning_effort": "medium"},
+				{"name": "Default", "mode": "default", "model": nil, "reasoning_effort": nil},
+			}}})
 		case "turn/start":
 			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(msg.ID), "result": map[string]any{"turn": map[string]any{"id": "turn_1", "status": "inProgress"}}})
 			writeRPC(writer, map[string]any{"jsonrpc": "2.0", "method": "turn/started", "params": map[string]any{"threadId": "thread_1", "turn": map[string]any{"id": "turn_1", "status": "inProgress"}}})

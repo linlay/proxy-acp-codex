@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 
 	"github.com/coder/acp-go-sdk"
+
+	"proxy-acp-codex/internal/platform"
 )
 
 type acpPeer interface {
@@ -25,13 +27,16 @@ type acpPeer interface {
 }
 
 type appServerSession struct {
-	sessionID acp.SessionId
-	cwd       string
-	threadID  string
-	options   codexRuntimeOptions
-	cmd       *exec.Cmd
-	rpc       *jsonRPCClient
-	conn      acpPeer
+	sessionID              acp.SessionId
+	cwd                    string
+	threadID               string
+	options                codexRuntimeOptions
+	currentModel           string
+	currentReasoningEffort string
+	collaborationModes     map[string]appServerCollaborationMode
+	cmd                    *exec.Cmd
+	rpc                    *jsonRPCClient
+	conn                   acpPeer
 
 	mu                 sync.Mutex
 	activeTurnID       string
@@ -42,12 +47,21 @@ type appServerSession struct {
 	commandOutputs     map[string]*strings.Builder
 	mcpProgress        map[string][]string
 	completedOnStart   map[string]bool
+	seenPlanStarted    map[string]bool
+	seenPlanDelta      map[string]bool
 	closed             bool
 }
 
 type appTurnResult struct {
 	stop acp.StopReason
 	err  error
+}
+
+type appServerCollaborationMode struct {
+	Name            string  `json:"name"`
+	Mode            string  `json:"mode"`
+	Model           *string `json:"model"`
+	ReasoningEffort *string `json:"reasoning_effort"`
 }
 
 func startAppServerSession(ctx context.Context, codexCommand string, appArgs []string, options codexRuntimeOptions, cwd string, sessionID acp.SessionId, conn acpPeer) (*appServerSession, error) {
@@ -99,6 +113,7 @@ func startAppServerSession(ctx context.Context, codexCommand string, appArgs []s
 		session.close()
 		return nil, err
 	}
+	session.loadCollaborationModes(ctx)
 	return session, nil
 }
 
@@ -124,6 +139,8 @@ func (s *appServerSession) startThread(ctx context.Context) error {
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
+		Model           string  `json:"model"`
+		ReasoningEffort *string `json:"reasoningEffort"`
 	}
 	params := map[string]any{
 		"cwd":                    s.cwd,
@@ -157,10 +174,37 @@ func (s *appServerSession) startThread(ctx context.Context) error {
 		return fmt.Errorf("codex app-server thread/start returned empty thread id")
 	}
 	s.threadID = response.Thread.ID
+	s.currentModel = firstNonBlank(response.Model, s.options.model)
+	if response.ReasoningEffort != nil {
+		s.currentReasoningEffort = strings.TrimSpace(*response.ReasoningEffort)
+	}
 	return nil
 }
 
-func (s *appServerSession) prompt(ctx context.Context, text string) (acp.StopReason, error) {
+func (s *appServerSession) loadCollaborationModes(ctx context.Context) {
+	var response struct {
+		Data []appServerCollaborationMode `json:"data"`
+	}
+	if err := s.rpc.call(ctx, "collaborationMode/list", map[string]any{}, &response); err != nil {
+		return
+	}
+	modes := map[string]appServerCollaborationMode{}
+	for _, item := range response.Data {
+		mode := strings.TrimSpace(item.Mode)
+		if mode == "" {
+			continue
+		}
+		modes[mode] = item
+	}
+	if len(modes) == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.collaborationModes = modes
+	s.mu.Unlock()
+}
+
+func (s *appServerSession) prompt(ctx context.Context, text string, planningMode *bool) (acp.StopReason, error) {
 	done := make(chan appTurnResult, 1)
 	s.mu.Lock()
 	if s.turnDone != nil {
@@ -172,12 +216,14 @@ func (s *appServerSession) prompt(ctx context.Context, text string) (acp.StopRea
 	s.seenMessageDelta = map[string]bool{}
 	s.seenReasoningDelta = map[string]bool{}
 	s.messagePhases = map[string]string{}
+	s.seenPlanStarted = map[string]bool{}
+	s.seenPlanDelta = map[string]bool{}
 	s.mu.Unlock()
 
 	var response struct {
 		Turn appServerTurn `json:"turn"`
 	}
-	err := s.rpc.call(ctx, "turn/start", map[string]any{
+	params := map[string]any{
 		"threadId": s.threadID,
 		"cwd":      s.cwd,
 		"input": []map[string]any{{
@@ -185,7 +231,11 @@ func (s *appServerSession) prompt(ctx context.Context, text string) (acp.StopRea
 			"text":          text,
 			"text_elements": []any{},
 		}},
-	}, &response)
+	}
+	if mode := s.collaborationModePayload(planningMode); len(mode) > 0 {
+		params["collaborationMode"] = mode
+	}
+	err := s.rpc.call(ctx, "turn/start", params, &response)
 	if err != nil {
 		s.clearTurn(done)
 		return "", err
@@ -205,6 +255,49 @@ func (s *appServerSession) prompt(ctx context.Context, text string) (acp.StopRea
 		_ = s.cancel(context.Background())
 		return acp.StopReasonCancelled, nil
 	}
+}
+
+func (s *appServerSession) collaborationModePayload(planningMode *bool) map[string]any {
+	if planningMode == nil {
+		return nil
+	}
+	mode := "default"
+	if *planningMode {
+		mode = "plan"
+	}
+	s.mu.Lock()
+	preset := s.collaborationModes[mode]
+	currentModel := s.currentModel
+	currentReasoningEffort := s.currentReasoningEffort
+	s.mu.Unlock()
+
+	model := firstNonBlank(stringPointerValue(preset.Model), currentModel, s.options.model)
+	if model == "" {
+		return nil
+	}
+	reasoningEffort := stringPointerValue(preset.ReasoningEffort)
+	if reasoningEffort == "" && mode == "plan" {
+		reasoningEffort = firstNonBlank(currentReasoningEffort, s.options.reasoningEffort)
+	}
+	settings := map[string]any{
+		"model":                  model,
+		"reasoning_effort":       nil,
+		"developer_instructions": nil,
+	}
+	if reasoningEffort != "" {
+		settings["reasoning_effort"] = reasoningEffort
+	}
+	return map[string]any{
+		"mode":     mode,
+		"settings": settings,
+	}
+}
+
+func stringPointerValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func (s *appServerSession) cancel(ctx context.Context) error {
@@ -277,6 +370,8 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 				s.sendUpdate(acp.UpdateAgentMessageText(payload.Delta))
 			}
 		}
+	case "item/plan/delta":
+		s.handlePlanDelta(params)
 	case "item/reasoning/textDelta", "item/reasoning/summaryTextDelta":
 		var payload struct {
 			ItemID string `json:"itemId"`
@@ -360,6 +455,8 @@ func (s *appServerSession) handleNotification(method string, params json.RawMess
 
 func (s *appServerSession) handleStartedItem(item appServerItem, raw map[string]any) {
 	switch item.Type {
+	case "plan":
+		s.sendPlanningStart(item.ID)
 	case "agentMessage":
 		s.setMessagePhase(item.ID, item.Phase)
 	case "fileChange", "commandExecution", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration":
@@ -384,6 +481,11 @@ func (s *appServerSession) handleStartedItem(item appServerItem, raw map[string]
 
 func (s *appServerSession) handleCompletedItem(item appServerItem, raw map[string]any) {
 	switch item.Type {
+	case "plan":
+		if item.Text != "" && !s.hasPlanningDelta(item.ID) {
+			s.sendPlanningDelta(item.ID, item.Text)
+		}
+		s.sendPlanningEnd(item.ID)
 	case "agentMessage":
 		s.setMessagePhase(item.ID, item.Phase)
 		if isCommentaryAgentMessagePhase(item.Phase) {
@@ -427,6 +529,17 @@ func (s *appServerSession) handleCompletedItem(item appServerItem, raw map[strin
 	}
 }
 
+func (s *appServerSession) handlePlanDelta(params json.RawMessage) {
+	var payload struct {
+		ItemID string `json:"itemId"`
+		Delta  string `json:"delta"`
+	}
+	if json.Unmarshal(params, &payload) != nil || strings.TrimSpace(payload.ItemID) == "" || payload.Delta == "" {
+		return
+	}
+	s.sendPlanningDelta(payload.ItemID, payload.Delta)
+}
+
 func (s *appServerSession) handlePlanUpdated(params json.RawMessage) {
 	var payload struct {
 		Plan []struct {
@@ -454,6 +567,79 @@ func (s *appServerSession) handlePlanUpdated(params json.RawMessage) {
 	if len(entries) > 0 {
 		s.sendUpdate(acp.UpdatePlan(entries...))
 	}
+}
+
+func (s *appServerSession) sendPlanningStart(planningID string) {
+	planningID = strings.TrimSpace(planningID)
+	if planningID == "" {
+		return
+	}
+	if !s.markPlanningStarted(planningID) {
+		return
+	}
+	s.sendInternalPlanningEvent("planning.start", planningID, "")
+}
+
+func (s *appServerSession) sendPlanningDelta(planningID string, delta string) {
+	planningID = strings.TrimSpace(planningID)
+	if planningID == "" || delta == "" {
+		return
+	}
+	s.sendPlanningStart(planningID)
+	s.markPlanningDelta(planningID)
+	s.sendInternalPlanningEvent("planning.delta", planningID, delta)
+}
+
+func (s *appServerSession) sendPlanningEnd(planningID string) {
+	planningID = strings.TrimSpace(planningID)
+	if planningID == "" {
+		return
+	}
+	s.sendPlanningStart(planningID)
+	s.sendInternalPlanningEvent("planning.end", planningID, "")
+}
+
+func (s *appServerSession) sendInternalPlanningEvent(eventType string, planningID string, text string) {
+	messageID := planningID
+	s.sendUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock(text),
+			MessageId:     &messageID,
+			SessionUpdate: "agent_thought_chunk",
+			Meta: map[string]any{
+				platform.ACPMetaEventType:  eventType,
+				platform.ACPMetaPlanningID: planningID,
+			},
+		},
+	})
+}
+
+func (s *appServerSession) markPlanningStarted(planningID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seenPlanStarted == nil {
+		s.seenPlanStarted = map[string]bool{}
+	}
+	if s.seenPlanStarted[planningID] {
+		return false
+	}
+	s.seenPlanStarted[planningID] = true
+	return true
+}
+
+func (s *appServerSession) markPlanningDelta(planningID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seenPlanDelta == nil {
+		s.seenPlanDelta = map[string]bool{}
+	}
+	s.seenPlanDelta[planningID] = true
+}
+
+func (s *appServerSession) hasPlanningDelta(planningID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seenPlanDelta[planningID]
 }
 
 func (s *appServerSession) handleTokenUsageUpdated(params json.RawMessage) {

@@ -17,6 +17,8 @@ import (
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
+
+	"proxy-acp-codex/internal/platform"
 )
 
 var errCodexCLI = errors.New("codex cli returned an error")
@@ -259,7 +261,7 @@ func (a *agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 		if state.app == nil {
 			return acp.PromptResponse{}, fmt.Errorf("app-server backend is not initialized for session %q", params.SessionId)
 		}
-		stopReason, err := state.app.prompt(ctx, text)
+		stopReason, err := state.app.prompt(ctx, text, planningModeFromPromptMeta(params.Meta))
 		if err != nil {
 			return acp.PromptResponse{}, err
 		}
@@ -277,6 +279,31 @@ func (a *agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 		return acp.PromptResponse{}, err
 	}
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+}
+
+func planningModeFromPromptMeta(meta map[string]any) *bool {
+	if meta == nil {
+		return nil
+	}
+	value, ok := meta[platform.PromptMetaPlanningMode]
+	if !ok {
+		return nil
+	}
+	switch typed := value.(type) {
+	case bool:
+		return &typed
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(typed))
+		if normalized == "true" {
+			v := true
+			return &v
+		}
+		if normalized == "false" {
+			v := false
+			return &v
+		}
+	}
+	return nil
 }
 
 func (a *agent) runCodex(ctx context.Context, sessionID acp.SessionId, cwd string, args []string) (parseResult, error) {

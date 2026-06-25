@@ -12,21 +12,28 @@ import (
 const DoneSentinel = "[DONE]"
 
 type QueryRequest struct {
-	RequestID   string         `json:"requestId,omitempty"`
-	RunID       string         `json:"runId,omitempty"`
-	ChatID      string         `json:"chatId,omitempty"`
-	AgentKey    string         `json:"agentKey,omitempty"`
-	TeamID      string         `json:"teamId,omitempty"`
-	Role        string         `json:"role,omitempty"`
-	Message     string         `json:"message"`
-	References  []Reference    `json:"references,omitempty"`
-	Params      map[string]any `json:"params,omitempty"`
-	AccessLevel string         `json:"accessLevel,omitempty"`
-	Model       *ModelOptions  `json:"model,omitempty"`
-	Scene       *Scene         `json:"scene,omitempty"`
-	Stream      *bool          `json:"stream,omitempty"`
-	Hidden      *bool          `json:"hidden,omitempty"`
+	RequestID    string         `json:"requestId,omitempty"`
+	RunID        string         `json:"runId,omitempty"`
+	ChatID       string         `json:"chatId,omitempty"`
+	AgentKey     string         `json:"agentKey,omitempty"`
+	TeamID       string         `json:"teamId,omitempty"`
+	Role         string         `json:"role,omitempty"`
+	Message      string         `json:"message"`
+	PlanningMode *bool          `json:"planningMode,omitempty"`
+	References   []Reference    `json:"references,omitempty"`
+	Params       map[string]any `json:"params,omitempty"`
+	AccessLevel  string         `json:"accessLevel,omitempty"`
+	Model        *ModelOptions  `json:"model,omitempty"`
+	Scene        *Scene         `json:"scene,omitempty"`
+	Stream       *bool          `json:"stream,omitempty"`
+	Hidden       *bool          `json:"hidden,omitempty"`
 }
+
+const (
+	PromptMetaPlanningMode = "proxy-acp-codex/planningMode"
+	ACPMetaEventType       = "proxy-acp-codex/eventType"
+	ACPMetaPlanningID      = "proxy-acp-codex/planningId"
+)
 
 type ModelOptions struct {
 	Key             string `json:"key,omitempty"`
@@ -269,7 +276,7 @@ func DecodeJSON[T any](data []byte) (T, error) {
 func orderedPayloadKeys(eventType string) []string {
 	switch eventType {
 	case "request.query":
-		return []string{"requestId", "runId", "chatId", "agentKey", "role", "message", "references", "params", "accessLevel", "model", "scene"}
+		return []string{"requestId", "runId", "chatId", "agentKey", "role", "message", "planningMode", "references", "params", "accessLevel", "model", "scene"}
 	case "run.start":
 		return []string{"runId", "chatId", "agentKey"}
 	case "content.start":
@@ -293,15 +300,23 @@ func orderedPayloadKeys(eventType string) []string {
 	case "tool.result":
 		return []string{"toolId", "result", "hitl", "error", "exitCode"}
 	case "awaiting.ask":
-		return []string{"awaitingId", "mode", "viewportType", "viewportKey", "timeout", "runId", "questions", "approvals", "forms"}
+		return []string{"awaitingId", "mode", "viewportType", "viewportKey", "timeout", "runId", "questions", "approvals", "forms", "plan"}
 	case "request.submit":
 		return []string{"requestId", "chatId", "runId", "awaitingId", "params"}
 	case "awaiting.answer":
-		return []string{"awaitingId", "mode", "status", "answers", "approvals", "error"}
+		return []string{"awaitingId", "mode", "status", "answers", "approvals", "forms", "plan", "error"}
 	case "request.steer":
 		return []string{"requestId", "chatId", "runId", "steerId", "message"}
 	case "plan.create", "plan.update":
 		return []string{"planId", "chatId", "plan"}
+	case "planning.start":
+		return []string{"planningId"}
+	case "planning.delta":
+		return []string{"planningId", "delta"}
+	case "planning.end":
+		return []string{"planningId"}
+	case "planning.snapshot":
+		return []string{"planningId", "planningFile", "chatId", "runId", "text"}
 	case "run.complete":
 		return []string{"runId", "finishReason", "usage"}
 	case "run.cancel":

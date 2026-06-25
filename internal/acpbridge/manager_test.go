@@ -116,6 +116,138 @@ func TestManagerExecuteMapsACPUpdatesToPlatformEvents(t *testing.T) {
 	}
 }
 
+func TestManagerExecuteForwardsPlanningModeToACPPromptMeta(t *testing.T) {
+	m := NewManager(testConfig(t))
+	defer m.Close()
+
+	planningMode := true
+	sink := &recordingSink{}
+	err := m.Execute(context.Background(), platform.QueryRequest{
+		RequestID:    "req_plan",
+		RunID:        "run_plan",
+		ChatID:       "chat_plan",
+		AgentKey:     "fake",
+		Message:      "plan",
+		Params:       testParams(t),
+		PlanningMode: &planningMode,
+	}, sink)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	events := sink.snapshot()
+	request := findEvent(events, "request.query")
+	if request.Payload["planningMode"] != true {
+		t.Fatalf("request.query planningMode = %#v, want true", request.Payload["planningMode"])
+	}
+	if !containsDelta(events, " planning-meta-true") {
+		t.Fatalf("expected planning mode to reach ACP prompt meta, got %#v", events)
+	}
+}
+
+func TestManagerPlanHITLApproveContinuesWithoutPlanningMode(t *testing.T) {
+	m := NewManager(testConfig(t))
+	defer m.Close()
+
+	planningMode := true
+	sink := &recordingSink{}
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Execute(context.Background(), platform.QueryRequest{
+			RequestID:    "req_plan_hitl_approve",
+			RunID:        "run_plan_hitl_approve",
+			ChatID:       "chat_plan_hitl_approve",
+			AgentKey:     "fake",
+			Message:      "plan-hitl",
+			Params:       testParams(t),
+			PlanningMode: &planningMode,
+		}, sink)
+	}()
+
+	awaiting := waitForAwaiting(t, sink, "plan")
+	awaitingID, _ := awaiting.Payload["awaitingId"].(string)
+	plan, _ := awaiting.Payload["plan"].(map[string]any)
+	if plan["id"] == "" || plan["title"] != "实施此计划？" {
+		t.Fatalf("unexpected plan payload %#v", plan)
+	}
+
+	resp, ok := m.Submit(platform.SubmitRequest{
+		RunID:      "run_plan_hitl_approve",
+		AwaitingID: awaitingID,
+		Params:     []map[string]any{{"id": plan["id"], "planningId": plan["planningId"], "decision": "approve"}},
+	})
+	if !ok || !resp.Accepted {
+		t.Fatalf("submit response = %#v ok=%v", resp, ok)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	events := sink.snapshot()
+	types := eventTypes(events)
+	assertEventOrder(t, types, "planning.end", "awaiting.ask")
+	assertEventOrder(t, types, "awaiting.ask", "request.submit")
+	assertEventOrder(t, types, "request.submit", "awaiting.answer")
+	assertEventOrder(t, types, "awaiting.answer", "request.steer")
+	assertEventOrder(t, types, "request.steer", "run.complete")
+	answerPlan, _ := findEvent(events, "awaiting.answer").Payload["plan"].(map[string]any)
+	if answerPlan["decision"] != "approve" {
+		t.Fatalf("answer plan = %#v, want approve", answerPlan)
+	}
+	if !containsDelta(events, " planning-meta-false") {
+		t.Fatalf("expected approved plan continuation to disable planning mode, got %#v", events)
+	}
+}
+
+func TestManagerPlanHITLRejectContinuesWithPlanningModeAndReason(t *testing.T) {
+	m := NewManager(testConfig(t))
+	defer m.Close()
+
+	planningMode := true
+	sink := &recordingSink{}
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Execute(context.Background(), platform.QueryRequest{
+			RequestID:    "req_plan_hitl_reject",
+			RunID:        "run_plan_hitl_reject",
+			ChatID:       "chat_plan_hitl_reject",
+			AgentKey:     "fake",
+			Message:      "plan-hitl",
+			Params:       testParams(t),
+			PlanningMode: &planningMode,
+		}, sink)
+	}()
+
+	awaiting := waitForAwaiting(t, sink, "plan")
+	awaitingID, _ := awaiting.Payload["awaitingId"].(string)
+	plan, _ := awaiting.Payload["plan"].(map[string]any)
+	resp, ok := m.Submit(platform.SubmitRequest{
+		RunID:      "run_plan_hitl_reject",
+		AwaitingID: awaitingID,
+		Params:     []map[string]any{{"id": plan["id"], "planningId": plan["planningId"], "decision": "reject", "reason": "请增加验证步骤"}},
+	})
+	if !ok || !resp.Accepted {
+		t.Fatalf("submit response = %#v ok=%v", resp, ok)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	events := sink.snapshot()
+	answerPlan, _ := findEvent(events, "awaiting.answer").Payload["plan"].(map[string]any)
+	if answerPlan["decision"] != "reject" || answerPlan["reason"] != "请增加验证步骤" {
+		t.Fatalf("answer plan = %#v, want reject with reason", answerPlan)
+	}
+	steer := findEvent(events, "request.steer")
+	message, _ := steer.Payload["message"].(string)
+	if !strings.Contains(message, "请增加验证步骤") {
+		t.Fatalf("request.steer message = %q, want reason", message)
+	}
+	if countContentDelta(events, " planning-meta-true") < 2 {
+		t.Fatalf("expected rejected plan continuation to keep planning mode enabled, got %#v", events)
+	}
+}
+
 func TestPermissionApprovalsFormatsCommandAndExecpolicyOption(t *testing.T) {
 	tool := acp.ToolCallUpdate{
 		ToolCallId: "cmd_1",
@@ -1038,6 +1170,30 @@ func containsDelta(events []platform.EventData, want string) bool {
 		}
 	}
 	return false
+}
+
+func countContentDelta(events []platform.EventData, want string) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == "content.delta" && event.Payload["delta"] == want {
+			count++
+		}
+	}
+	return count
+}
+
+func waitForAwaiting(t *testing.T, sink *recordingSink, mode string) platform.EventData {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		for _, event := range sink.snapshot() {
+			if event.Type == "awaiting.ask" && event.Payload["mode"] == mode {
+				return event
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected awaiting.ask mode=%s, got %#v", mode, eventTypes(sink.snapshot()))
+	return platform.EventData{}
 }
 
 func assertEventOrder(t *testing.T, events []string, before string, after string) {

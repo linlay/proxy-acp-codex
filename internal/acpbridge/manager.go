@@ -98,6 +98,36 @@ func (m *Manager) Submit(req platform.SubmitRequest) (platform.SubmitResponse, b
 		}, false
 	}
 
+	if pending.mode == "plan" {
+		decision := planDecisionFromSubmit(req.Params)
+		select {
+		case pending.planReply <- decision:
+			return platform.SubmitResponse{
+				Accepted:   true,
+				Status:     "accepted",
+				RunID:      req.RunID,
+				AwaitingID: req.AwaitingID,
+				Detail:     "ACP plan response forwarded",
+			}, true
+		case <-pending.done:
+			return platform.SubmitResponse{
+				Accepted:   false,
+				Status:     "stale",
+				RunID:      req.RunID,
+				AwaitingID: req.AwaitingID,
+				Detail:     "ACP plan request already completed",
+			}, true
+		case <-time.After(2 * time.Second):
+			return platform.SubmitResponse{
+				Accepted:   false,
+				Status:     "timeout",
+				RunID:      req.RunID,
+				AwaitingID: req.AwaitingID,
+				Detail:     "Timed out forwarding ACP plan response",
+			}, true
+		}
+	}
+
 	outcome := permissionOutcomeFromSubmit(req.Params, pending.options)
 	if pending.mode == "question" {
 		outcome = questionOutcomeFromSubmit(req.Params, pending.questions)
@@ -636,7 +666,7 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 		s.mu.Unlock()
 	}()
 
-	t.emit("request.query", map[string]any{
+	queryPayload := map[string]any{
 		"requestId":   req.RequestID,
 		"runId":       req.RunID,
 		"chatId":      req.ChatID,
@@ -648,7 +678,11 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 		"accessLevel": req.AccessLevel,
 		"model":       req.Model,
 		"scene":       req.Scene,
-	})
+	}
+	if req.PlanningMode != nil {
+		queryPayload["planningMode"] = *req.PlanningMode
+	}
+	t.emit("request.query", queryPayload)
 	t.emit("run.start", map[string]any{"runId": req.RunID, "chatId": req.ChatID, "agentKey": req.AgentKey})
 
 	prompt, err := promptBlocks(req)
@@ -657,7 +691,8 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 		return err
 	}
 
-	resp, err := s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.sessionID, Prompt: prompt})
+	currentReq := req
+	resp, err := s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.sessionID, Prompt: prompt, Meta: promptRequestMeta(currentReq)})
 	for {
 		t.closeOpenStreams()
 		if err != nil {
@@ -667,15 +702,39 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 		if resp.StopReason == acp.StopReasonCancelled {
 			break
 		}
+		if planningModeEnabled(currentReq) {
+			if planningID, planText, ok := t.pendingPlanApproval(); ok {
+				decision, accepted := t.requestPlanApproval(ctx, planningID, planText)
+				if !accepted {
+					break
+				}
+				steerReq := planContinuationRequest(currentReq, decision, planText)
+				t.emit("request.steer", map[string]any{
+					"requestId": steerReq.RequestID,
+					"chatId":    steerReq.ChatID,
+					"runId":     t.req.RunID,
+					"steerId":   stableID(t.req.RunID, "plan_"+planningID+"_"+decision.Decision),
+					"message":   steerReq.Message,
+				})
+				prompt, err = promptBlocks(steerReq)
+				if err != nil {
+					t.emitRunError(err)
+					return err
+				}
+				currentReq = steerReq
+				resp, err = s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.sessionID, Prompt: prompt, Meta: promptRequestMeta(currentReq)})
+				continue
+			}
+		}
 		steer, ok := t.nextSteer()
 		if !ok {
 			break
 		}
-		steerReq := req
+		steerReq := currentReq
 		steerReq.RequestID = steer.RequestID
-		steerReq.ChatID = firstNonBlank(steer.ChatID, req.ChatID)
-		steerReq.AgentKey = firstNonBlank(steer.AgentKey, req.AgentKey)
-		steerReq.TeamID = firstNonBlank(steer.TeamID, req.TeamID)
+		steerReq.ChatID = firstNonBlank(steer.ChatID, currentReq.ChatID, req.ChatID)
+		steerReq.AgentKey = firstNonBlank(steer.AgentKey, currentReq.AgentKey, req.AgentKey)
+		steerReq.TeamID = firstNonBlank(steer.TeamID, currentReq.TeamID, req.TeamID)
 		steerReq.Message = steer.Message
 		steerReq.References = nil
 		prompt, err = promptBlocks(steerReq)
@@ -683,7 +742,8 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 			t.emitRunError(err)
 			return err
 		}
-		resp, err = s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.sessionID, Prompt: prompt})
+		currentReq = steerReq
+		resp, err = s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.sessionID, Prompt: prompt, Meta: promptRequestMeta(currentReq)})
 	}
 
 	switch resp.StopReason {
@@ -693,6 +753,37 @@ func (s *backendSession) prompt(ctx context.Context, req platform.QueryRequest, 
 		t.emit("run.complete", map[string]any{"runId": req.RunID, "finishReason": string(resp.StopReason), "usage": usagePayload(resp.Usage)})
 	}
 	return nil
+}
+
+func promptRequestMeta(req platform.QueryRequest) map[string]any {
+	if req.PlanningMode == nil {
+		return nil
+	}
+	return map[string]any{platform.PromptMetaPlanningMode: *req.PlanningMode}
+}
+
+func planningModeEnabled(req platform.QueryRequest) bool {
+	return req.PlanningMode != nil && *req.PlanningMode
+}
+
+func planContinuationRequest(base platform.QueryRequest, decision planDecision, planText string) platform.QueryRequest {
+	next := base
+	next.RequestID = stableID(base.RunID, "plan_"+decision.Decision+"_"+time.Now().UTC().Format("20060102150405.000000000"))
+	next.References = nil
+	if decision.Decision == "approve" {
+		disabled := false
+		next.PlanningMode = &disabled
+		next.Message = fmt.Sprintf("用户已经批准计划。请基于已确认计划继续执行，不要再次请求确认。\n\n已确认计划：\n%s", strings.TrimSpace(planText))
+		return next
+	}
+	enabled := true
+	next.PlanningMode = &enabled
+	reason := strings.TrimSpace(decision.Reason)
+	if reason == "" {
+		reason = "未提供具体修改意见。"
+	}
+	next.Message = fmt.Sprintf("用户已经拒绝计划。请根据反馈修订方案或给出下一步，不要执行被拒绝的计划。\n\n反馈：%s\n\n被拒绝的计划：\n%s", reason, strings.TrimSpace(planText))
+	return next
 }
 
 func (s *backendSession) cancel(ctx context.Context) error {

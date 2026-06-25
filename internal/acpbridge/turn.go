@@ -32,6 +32,10 @@ type turn struct {
 	reasoningFallbackID string
 	reasoningSegments   map[string]int
 	planSeen            bool
+	planningID          string
+	planningText        strings.Builder
+	planningEnded       bool
+	awaitedPlanningID   string
 	toolStarted         map[string]bool
 	toolEnded           map[string]bool
 	steers              []platform.SteerRequest
@@ -46,7 +50,14 @@ type pendingPermission struct {
 	options    []acp.PermissionOption
 	questions  []map[string]any
 	response   chan acp.RequestPermissionOutcome
+	planReply  chan planDecision
 	done       chan struct{}
+}
+
+type planDecision struct {
+	Decision string
+	Reason   string
+	Params   []map[string]any
 }
 
 func newTurn(req platform.QueryRequest, sink EventSink, mgr *Manager) *turn {
@@ -172,6 +183,9 @@ func (t *turn) handleUpdate(update acp.SessionUpdate) error {
 			t.emit("content.delta", map[string]any{"contentId": contentID, "delta": text})
 		}
 	case update.AgentThoughtChunk != nil:
+		if t.handleInternalPlanningUpdate(*update.AgentThoughtChunk) {
+			return nil
+		}
 		text := contentBlockText(update.AgentThoughtChunk.Content)
 		if text != "" {
 			reasoningID := t.ensureReasoning(t.reasoningIDForChunk(*update.AgentThoughtChunk))
@@ -203,6 +217,74 @@ func (t *turn) handleUpdate(update acp.SessionUpdate) error {
 		})
 	}
 	return nil
+}
+
+func (t *turn) handleInternalPlanningUpdate(chunk acp.SessionUpdateAgentThoughtChunk) bool {
+	if chunk.Meta == nil {
+		return false
+	}
+	eventType := strings.TrimSpace(fmt.Sprint(chunk.Meta[platform.ACPMetaEventType]))
+	if eventType == "" {
+		return false
+	}
+	switch eventType {
+	case "planning.start", "planning.delta", "planning.end":
+	default:
+		return false
+	}
+	planningID := strings.TrimSpace(fmt.Sprint(chunk.Meta[platform.ACPMetaPlanningID]))
+	if planningID == "" || planningID == "<nil>" {
+		return false
+	}
+	t.closeActiveReasoning()
+	delta := ""
+	if eventType == "planning.delta" {
+		delta = contentBlockText(chunk.Content)
+	}
+	t.recordPlanningEvent(eventType, planningID, delta)
+	payload := map[string]any{"planningId": planningID}
+	if eventType == "planning.delta" {
+		payload["delta"] = delta
+	}
+	t.emit(eventType, payload)
+	return true
+}
+
+func (t *turn) recordPlanningEvent(eventType string, planningID string, delta string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.planningID != planningID {
+		t.planningID = planningID
+		t.planningText.Reset()
+		t.planningEnded = false
+	}
+	switch eventType {
+	case "planning.start":
+		t.planningText.Reset()
+		t.planningEnded = false
+		if t.awaitedPlanningID == planningID {
+			t.awaitedPlanningID = ""
+		}
+	case "planning.delta":
+		t.planningText.WriteString(delta)
+	case "planning.end":
+		t.planningEnded = true
+	}
+}
+
+func (t *turn) pendingPlanApproval() (string, string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	planningID := strings.TrimSpace(t.planningID)
+	if planningID == "" || !t.planningEnded || t.awaitedPlanningID == planningID {
+		return "", "", false
+	}
+	planText := strings.TrimSpace(t.planningText.String())
+	if planText == "" {
+		return "", "", false
+	}
+	t.awaitedPlanningID = planningID
+	return planningID, planText, true
 }
 
 func (t *turn) ensureContent() string {
@@ -480,6 +562,73 @@ func (t *turn) requestPermission(ctx context.Context, params acp.RequestPermissi
 	}
 }
 
+func (t *turn) requestPlanApproval(ctx context.Context, planningID string, planText string) (planDecision, bool) {
+	awaitingID := stableID(t.req.RunID, "plan_"+planningID)
+	pending := &pendingPermission{
+		runID:      t.req.RunID,
+		awaitingID: awaitingID,
+		mode:       "plan",
+		planReply:  make(chan planDecision, 1),
+		done:       make(chan struct{}),
+	}
+	t.mgr.registerAwaiting(pending)
+	defer func() {
+		close(pending.done)
+		t.mgr.unregisterAwaiting(awaitingID, pending)
+	}()
+
+	t.closeOpenTextStreams()
+	t.emit("awaiting.ask", map[string]any{
+		"awaitingId":   awaitingID,
+		"mode":         "plan",
+		"viewportType": "builtin",
+		"viewportKey":  "plan",
+		"timeout":      int64(0),
+		"runId":        t.req.RunID,
+		"plan": map[string]any{
+			"id":         awaitingID,
+			"planningId": planningID,
+			"title":      "实施此计划？",
+			"text":       planText,
+		},
+	})
+
+	select {
+	case decision := <-pending.planReply:
+		if decision.Params == nil {
+			decision.Params = []map[string]any{}
+		}
+		t.emit("request.submit", map[string]any{"runId": t.req.RunID, "chatId": t.req.ChatID, "awaitingId": awaitingID, "params": decision.Params})
+		if decision.Decision == "approve" || decision.Decision == "reject" {
+			plan := map[string]any{
+				"id":         awaitingID,
+				"planningId": planningID,
+				"decision":   decision.Decision,
+			}
+			if strings.TrimSpace(decision.Reason) != "" {
+				plan["reason"] = strings.TrimSpace(decision.Reason)
+			}
+			t.emit("awaiting.answer", map[string]any{"awaitingId": awaitingID, "mode": "plan", "status": "answered", "plan": plan})
+			return decision, true
+		}
+		t.emit("awaiting.answer", map[string]any{
+			"awaitingId": awaitingID,
+			"mode":       "plan",
+			"status":     "error",
+			"error":      map[string]any{"code": "user_dismissed", "message": "用户取消了计划确认"},
+		})
+		return decision, false
+	case <-ctx.Done():
+		t.emit("awaiting.answer", map[string]any{
+			"awaitingId": awaitingID,
+			"mode":       "plan",
+			"status":     "error",
+			"error":      map[string]any{"code": "timeout", "message": ctx.Err().Error()},
+		})
+		return planDecision{}, false
+	}
+}
+
 func contentBlockText(block acp.ContentBlock) string {
 	switch {
 	case block.Text != nil:
@@ -739,6 +888,23 @@ func questionOutcomeFromSubmit(params []map[string]any, questions []map[string]a
 			"answerText": answerText(answers),
 		},
 	}}
+}
+
+func planDecisionFromSubmit(params []map[string]any) planDecision {
+	decision := planDecision{Decision: "reject", Params: cloneMapSlice(params)}
+	if len(params) == 0 {
+		return decision
+	}
+	rawDecision := strings.ToLower(strings.TrimSpace(fmt.Sprint(params[0]["decision"])))
+	if rawDecision == "approve" {
+		decision.Decision = "approve"
+	} else {
+		decision.Decision = "reject"
+	}
+	if reason, ok := params[0]["reason"]; ok {
+		decision.Reason = strings.TrimSpace(fmt.Sprint(reason))
+	}
+	return decision
 }
 
 func normalizeQuestionAnswers(params []map[string]any, questions []map[string]any) []map[string]any {
