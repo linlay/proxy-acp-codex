@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,6 +184,9 @@ func (t *turn) handleUpdate(update acp.SessionUpdate) error {
 			t.emit("content.delta", map[string]any{"contentId": contentID, "delta": text})
 		}
 	case update.AgentThoughtChunk != nil:
+		if t.handleInternalUsageSnapshotUpdate(*update.AgentThoughtChunk) {
+			return nil
+		}
 		if t.handleInternalPlanningUpdate(*update.AgentThoughtChunk) {
 			return nil
 		}
@@ -219,6 +223,23 @@ func (t *turn) handleUpdate(update acp.SessionUpdate) error {
 	return nil
 }
 
+func (t *turn) handleInternalUsageSnapshotUpdate(chunk acp.SessionUpdateAgentThoughtChunk) bool {
+	if chunk.Meta == nil {
+		return false
+	}
+	eventType := strings.TrimSpace(fmt.Sprint(chunk.Meta[platform.ACPMetaEventType]))
+	if eventType != "usage.snapshot" {
+		return false
+	}
+	payload := normalizedUsageSnapshotPayload(chunk.Meta[platform.ACPMetaUsageSnapshot])
+	if len(payload) == 0 {
+		return true
+	}
+	t.closeActiveReasoning()
+	t.emit("usage.snapshot", payload)
+	return true
+}
+
 func (t *turn) handleInternalPlanningUpdate(chunk acp.SessionUpdateAgentThoughtChunk) bool {
 	if chunk.Meta == nil {
 		return false
@@ -248,6 +269,165 @@ func (t *turn) handleInternalPlanningUpdate(chunk acp.SessionUpdateAgentThoughtC
 	}
 	t.emit(eventType, payload)
 	return true
+}
+
+func normalizedUsageSnapshotPayload(value any) map[string]any {
+	raw, ok := anyMap(value)
+	if !ok {
+		return nil
+	}
+	out := map[string]any{}
+	if model, ok := normalizedStringMap(raw["model"]); ok {
+		out["model"] = model
+	}
+	if contextWindow, ok := normalizedContextWindow(raw["contextWindow"]); ok {
+		out["contextWindow"] = contextWindow
+	}
+	if usage, ok := normalizedUsageSnapshotUsage(raw["usage"]); ok {
+		out["usage"] = usage
+	}
+	return out
+}
+
+func normalizedUsageSnapshotUsage(value any) (map[string]any, bool) {
+	raw, ok := anyMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for _, key := range []string{"current", "run", "chat"} {
+		if stats, ok := normalizedUsageStats(raw[key]); ok {
+			out[key] = stats
+		}
+	}
+	return out, len(out) > 0
+}
+
+func normalizedUsageStats(value any) (map[string]any, bool) {
+	raw, ok := anyMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for _, key := range []string{"modelKey", "reasoningEffort"} {
+		if text := strings.TrimSpace(fmt.Sprint(raw[key])); text != "" && text != "<nil>" {
+			out[key] = text
+		}
+	}
+	for _, key := range []string{"promptTokens", "completionTokens", "totalTokens", "llmChatCompletionCount", "toolCallCount"} {
+		if number, ok := intFromAny(raw[key]); ok {
+			out[key] = number
+		}
+	}
+	if details, ok := normalizedUsageTokenDetails(raw["promptTokensDetails"], []string{"cacheHitTokens", "cacheMissTokens"}); ok {
+		out["promptTokensDetails"] = details
+	}
+	if details, ok := normalizedUsageTokenDetails(raw["completionTokensDetails"], []string{"reasoningTokens"}); ok {
+		out["completionTokensDetails"] = details
+	}
+	return out, len(out) > 0
+}
+
+func normalizedContextWindow(value any) (map[string]any, bool) {
+	raw, ok := anyMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for _, key := range []string{"modelKey", "reasoningEffort"} {
+		if text := strings.TrimSpace(fmt.Sprint(raw[key])); text != "" && text != "<nil>" {
+			out[key] = text
+		}
+	}
+	for _, key := range []string{"maxSize", "currentSize", "estimatedNextCallSize"} {
+		if number, ok := intFromAny(raw[key]); ok {
+			out[key] = number
+		}
+	}
+	return out, len(out) > 0
+}
+
+func normalizedUsageTokenDetails(value any, keys []string) (map[string]any, bool) {
+	raw, ok := anyMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for _, key := range keys {
+		if number, ok := intFromAny(raw[key]); ok {
+			out[key] = number
+		}
+	}
+	return out, len(out) > 0
+}
+
+func normalizedStringMap(value any) (map[string]any, bool) {
+	raw, ok := anyMap(value)
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{}
+	for key, value := range raw {
+		if text := strings.TrimSpace(fmt.Sprint(value)); text != "" && text != "<nil>" {
+			out[key] = text
+		}
+	}
+	return out, len(out) > 0
+}
+
+func anyMap(value any) (map[string]any, bool) {
+	if value == nil {
+		return nil, false
+	}
+	if typed, ok := value.(map[string]any); ok {
+		return typed, true
+	}
+	return nil, false
+}
+
+func intFromAny(value any) (int, bool) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, false
+	case int:
+		return typed, true
+	case int8:
+		return int(typed), true
+	case int16:
+		return int(typed), true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case uint:
+		return int(typed), true
+	case uint8:
+		return int(typed), true
+	case uint16:
+		return int(typed), true
+	case uint32:
+		return int(typed), true
+	case uint64:
+		return int(typed), true
+	case float32:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		n, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
 }
 
 func (t *turn) recordPlanningEvent(eventType string, planningID string, delta string) {

@@ -33,6 +33,7 @@ const (
 	PromptMetaPlanningMode = "proxy-acp-codex/planningMode"
 	ACPMetaEventType       = "proxy-acp-codex/eventType"
 	ACPMetaPlanningID      = "proxy-acp-codex/planningId"
+	ACPMetaUsageSnapshot   = "proxy-acp-codex/usageSnapshot"
 )
 
 type ModelOptions struct {
@@ -317,6 +318,8 @@ func orderedPayloadKeys(eventType string) []string {
 		return []string{"planningId"}
 	case "planning.snapshot":
 		return []string{"planningId", "planningFile", "chatId", "runId", "text"}
+	case "usage.snapshot":
+		return []string{"runId", "chatId", "model", "contextWindow", "usage"}
 	case "run.complete":
 		return []string{"runId", "finishReason", "usage"}
 	case "run.cancel":

@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +28,7 @@ func TestQuerySSEAndSubmit(t *testing.T) {
 	defer manager.Close()
 	handler := New(cfg, manager)
 
-	server := httptest.NewServer(handler)
+	server := newTestServer(t, handler)
 	defer server.Close()
 
 	root := repoRoot(t)
@@ -105,7 +106,9 @@ func TestQuerySSEAndSubmit(t *testing.T) {
 			t.Fatalf("missing %s, seen %#v", want, seen)
 		}
 	}
+	assertUsageSnapshotEvent(t, events, "run_http")
 	assertContentEventOrder(t, events, "run_http",
+		"usage.snapshot",
 		"awaiting.ask",
 		"request.steer",
 		"request.submit",
@@ -130,7 +133,7 @@ func TestModelsEndpointUsesCodexDebugModels(t *testing.T) {
 	manager := acpbridge.NewManager(cfg)
 	defer manager.Close()
 	handler := New(cfg, manager)
-	server := httptest.NewServer(handler)
+	server := newTestServer(t, handler)
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/api/models")
@@ -168,7 +171,7 @@ func TestAccessLevelEndpointResolvesPendingApproval(t *testing.T) {
 	defer manager.Close()
 	handler := New(cfg, manager)
 
-	server := httptest.NewServer(handler)
+	server := newTestServer(t, handler)
 	defer server.Close()
 
 	root := repoRoot(t)
@@ -230,7 +233,7 @@ func TestQueryWebSocketSubmitAndSteer(t *testing.T) {
 	defer manager.Close()
 	handler := New(cfg, manager)
 
-	server := httptest.NewServer(handler)
+	server := newTestServer(t, handler)
 	defer server.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
@@ -321,7 +324,9 @@ func TestQueryWebSocketSubmitAndSteer(t *testing.T) {
 			t.Fatalf("missing %s, seen %#v", want, seen)
 		}
 	}
+	assertUsageSnapshotEvent(t, events, "run_ws")
 	assertContentEventOrder(t, events, "run_ws",
+		"usage.snapshot",
 		"awaiting.ask",
 		"request.steer",
 		"request.submit",
@@ -336,7 +341,7 @@ func TestQueryWebSocketAccessLevelResolvesPendingApproval(t *testing.T) {
 	defer manager.Close()
 	handler := New(cfg, manager)
 
-	server := httptest.NewServer(handler)
+	server := newTestServer(t, handler)
 	defer server.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
@@ -517,4 +522,83 @@ func eventTypes(events []platform.EventData) []string {
 		out = append(out, event.Type)
 	}
 	return out
+}
+
+type testServer struct {
+	URL      string
+	server   *http.Server
+	listener net.Listener
+}
+
+func newTestServer(t *testing.T, handler http.Handler) *testServer {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp4: %v", err)
+	}
+	srv := &http.Server{Handler: handler}
+	ts := &testServer{
+		URL:      "http://" + listener.Addr().String(),
+		server:   srv,
+		listener: listener,
+	}
+	go func() {
+		_ = srv.Serve(listener)
+	}()
+	return ts
+}
+
+func (s *testServer) Close() {
+	_ = s.server.Close()
+	_ = s.listener.Close()
+}
+
+func assertUsageSnapshotEvent(t *testing.T, events []platform.EventData, runID string) {
+	t.Helper()
+	idx := eventPosition(events, "usage.snapshot", 0)
+	if idx < 0 {
+		t.Fatalf("missing usage.snapshot in %#v", eventTypes(events))
+	}
+	event := events[idx]
+	gotRunID, _ := event.Payload["runId"].(string)
+	if gotRunID != runID {
+		t.Fatalf("usage snapshot runId = %q, want %q", gotRunID, runID)
+	}
+	usage, _ := event.Payload["usage"].(map[string]any)
+	current, _ := usage["current"].(map[string]any)
+	if got, ok := intFromAny(current["totalTokens"]); !ok || got != 16565 {
+		t.Fatalf("usage current = %#v", current)
+	}
+	contextWindow, _ := event.Payload["contextWindow"].(map[string]any)
+	if got, ok := intFromAny(contextWindow["maxSize"]); !ok || got != 272000 {
+		t.Fatalf("context window = %#v", contextWindow)
+	}
+	if got, ok := intFromAny(contextWindow["currentSize"]); !ok || got != 16513 {
+		t.Fatalf("context window = %#v", contextWindow)
+	}
+}
+
+func intFromAny(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		n, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
 }

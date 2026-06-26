@@ -104,6 +104,9 @@ func (a *agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.Promp
 	}); err != nil {
 		return acp.PromptResponse{}, err
 	}
+	if err := a.emitUsageSnapshot(ctx, params.SessionId); err != nil {
+		return acp.PromptResponse{}, err
+	}
 	if strings.Contains(promptText(params), "permission") {
 		resp, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
 			SessionId: params.SessionId,
@@ -191,6 +194,45 @@ func (a *agent) emitPlanning(ctx context.Context, sessionID acp.SessionId, plann
 		}
 	}
 	return nil
+}
+
+func (a *agent) emitUsageSnapshot(ctx context.Context, sessionID acp.SessionId) error {
+	return a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: sessionID,
+		Update: acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content: acp.TextBlock(""),
+			Meta: map[string]any{
+				platform.ACPMetaEventType: "usage.snapshot",
+				platform.ACPMetaUsageSnapshot: map[string]any{
+					"model": map[string]any{"key": "fake-model"},
+					"contextWindow": map[string]any{
+						"maxSize":         272000,
+						"currentSize":     16513,
+						"modelKey":        "fake-model",
+						"reasoningEffort": "medium",
+					},
+					"usage": map[string]any{
+						"current": map[string]any{
+							"modelKey":               "fake-model",
+							"reasoningEffort":        "medium",
+							"promptTokens":           16513,
+							"completionTokens":       52,
+							"totalTokens":            16565,
+							"llmChatCompletionCount": 1,
+							"promptTokensDetails": map[string]any{
+								"cacheHitTokens":  2432,
+								"cacheMissTokens": 14081,
+							},
+							"completionTokensDetails": map[string]any{
+								"reasoningTokens": 45,
+							},
+						},
+					},
+				},
+			},
+			SessionUpdate: "agent_thought_chunk",
+		}},
+	})
 }
 
 func (a *agent) Cancel(context.Context, acp.CancelNotification) error { return nil }

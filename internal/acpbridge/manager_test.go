@@ -414,6 +414,80 @@ func TestTurnAutoSegmentsReasoningAroundToolUse(t *testing.T) {
 	}
 }
 
+func TestTurnMapsInternalUsageSnapshotToPlatformEvent(t *testing.T) {
+	m := NewManager(config.Config{})
+	defer m.Close()
+
+	sink := &recordingSink{}
+	turn := newTurn(platform.QueryRequest{
+		RunID:    "run_usage",
+		ChatID:   "chat_usage",
+		AgentKey: "fake",
+	}, sink, m)
+
+	if err := turn.handleUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock(""),
+			SessionUpdate: "agent_thought_chunk",
+			Meta: map[string]any{
+				platform.ACPMetaEventType: "usage.snapshot",
+				platform.ACPMetaUsageSnapshot: map[string]any{
+					"model": map[string]any{"key": "gpt-5.4"},
+					"contextWindow": map[string]any{
+						"maxSize":         float64(272000),
+						"currentSize":     "16513",
+						"modelKey":        "gpt-5.4",
+						"reasoningEffort": "medium",
+					},
+					"usage": map[string]any{
+						"current": map[string]any{
+							"modelKey":               "gpt-5.4",
+							"promptTokens":           float64(16513),
+							"completionTokens":       float64(52),
+							"totalTokens":            float64(16565),
+							"llmChatCompletionCount": float64(1),
+							"promptTokensDetails": map[string]any{
+								"cacheHitTokens":  float64(2432),
+								"cacheMissTokens": float64(14081),
+							},
+							"completionTokensDetails": map[string]any{
+								"reasoningTokens": float64(45),
+							},
+						},
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("usage update: %v", err)
+	}
+
+	events := sink.snapshot()
+	if got, want := eventTypes(events), []string{"usage.snapshot"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("event types = %#v, want %#v", got, want)
+	}
+	event := events[0]
+	assertEventIdentity(t, event, "run_usage", "chat_usage", "fake")
+	usage, _ := event.Payload["usage"].(map[string]any)
+	current, _ := usage["current"].(map[string]any)
+	if current["promptTokens"] != 16513 || current["completionTokens"] != 52 ||
+		current["totalTokens"] != 16565 || current["llmChatCompletionCount"] != 1 {
+		t.Fatalf("current usage = %#v", current)
+	}
+	promptDetails, _ := current["promptTokensDetails"].(map[string]any)
+	if promptDetails["cacheHitTokens"] != 2432 || promptDetails["cacheMissTokens"] != 14081 {
+		t.Fatalf("prompt details = %#v", promptDetails)
+	}
+	completionDetails, _ := current["completionTokensDetails"].(map[string]any)
+	if completionDetails["reasoningTokens"] != 45 {
+		t.Fatalf("completion details = %#v", completionDetails)
+	}
+	contextWindow, _ := event.Payload["contextWindow"].(map[string]any)
+	if contextWindow["maxSize"] != 272000 || contextWindow["currentSize"] != 16513 {
+		t.Fatalf("context window = %#v", contextWindow)
+	}
+}
+
 func TestManagerExecuteRequiresCWDParam(t *testing.T) {
 	m := NewManager(testConfig(t))
 	defer m.Close()

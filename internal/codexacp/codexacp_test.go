@@ -682,6 +682,132 @@ func TestAppServerCoreItemEventsMapToACPUpdates(t *testing.T) {
 	}
 }
 
+func TestAppServerTokenUsageFlushesUsageSnapshotOncePerTurn(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{
+		sessionID:              "sess_test",
+		threadID:               "thread_1",
+		currentModel:           "gpt-5.4",
+		currentReasoningEffort: "medium",
+		conn:                   peer,
+	}
+
+	session.handleNotification("thread/tokenUsage/updated", []byte(`{
+		"threadId":"thread_1",
+		"turnId":"turn_1",
+		"tokenUsage":{
+			"last":{"totalTokens":10,"inputTokens":8,"cachedInputTokens":2,"outputTokens":2,"reasoningOutputTokens":1},
+			"modelContextWindow":100
+		}
+	}`))
+	session.handleNotification("thread/tokenUsage/updated", []byte(`{
+		"threadId":"thread_1",
+		"turnId":"turn_1",
+		"tokenUsage":{
+			"last":{"totalTokens":16565,"inputTokens":16513,"cachedInputTokens":2432,"outputTokens":52,"reasoningOutputTokens":45},
+			"modelContextWindow":272000
+		}
+	}`))
+
+	if len(peer.thoughtMetas) != 0 {
+		t.Fatalf("usage snapshot should flush only when turn completes, got %#v", peer.thoughtMetas)
+	}
+	session.finishTurn("turn_1", appTurnResult{stop: acp.StopReasonEndTurn})
+
+	if len(peer.thoughtMetas) != 1 {
+		t.Fatalf("thought metas = %#v, want one usage snapshot", peer.thoughtMetas)
+	}
+	meta := peer.thoughtMetas[0]
+	if meta[platform.ACPMetaEventType] != "usage.snapshot" {
+		t.Fatalf("event type meta = %#v", meta)
+	}
+	payload, ok := meta[platform.ACPMetaUsageSnapshot].(map[string]any)
+	if !ok {
+		t.Fatalf("usage payload = %#v", meta[platform.ACPMetaUsageSnapshot])
+	}
+	usage, _ := payload["usage"].(map[string]any)
+	current, _ := usage["current"].(map[string]any)
+	if current["promptTokens"] != 16513 || current["completionTokens"] != 52 || current["totalTokens"] != 16565 {
+		t.Fatalf("current usage = %#v", current)
+	}
+	promptDetails, _ := current["promptTokensDetails"].(map[string]any)
+	if promptDetails["cacheHitTokens"] != 2432 || promptDetails["cacheMissTokens"] != 14081 {
+		t.Fatalf("prompt details = %#v", promptDetails)
+	}
+	completionDetails, _ := current["completionTokensDetails"].(map[string]any)
+	if completionDetails["reasoningTokens"] != 45 {
+		t.Fatalf("completion details = %#v", completionDetails)
+	}
+	contextWindow, _ := payload["contextWindow"].(map[string]any)
+	if contextWindow["maxSize"] != 272000 || contextWindow["currentSize"] != 16513 ||
+		contextWindow["modelKey"] != "gpt-5.4" || contextWindow["reasoningEffort"] != "medium" {
+		t.Fatalf("context window = %#v", contextWindow)
+	}
+	if len(peer.usages) != 2 || peer.usages[1].Used != 16513 || peer.usages[1].Size != 272000 {
+		t.Fatalf("compat usage updates = %#v", peer.usages)
+	}
+}
+
+func TestAppServerTokenUsageWithoutTurnIDDoesNotCarryAcrossTurns(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{
+		sessionID: "sess_test",
+		threadID:  "thread_1",
+		conn:      peer,
+	}
+
+	session.handleNotification("thread/tokenUsage/updated", []byte(`{
+		"threadId":"thread_1",
+		"tokenUsage":{
+			"last":{"totalTokens":42,"inputTokens":40,"cachedInputTokens":10,"outputTokens":2,"reasoningOutputTokens":1},
+			"modelContextWindow":1000
+		}
+	}`))
+	session.finishTurn("turn_1", appTurnResult{stop: acp.StopReasonEndTurn})
+
+	if len(peer.thoughtMetas) != 0 {
+		t.Fatalf("usage snapshot should not flush without turn binding, got %#v", peer.thoughtMetas)
+	}
+	if len(peer.usages) != 1 || peer.usages[0].Used != 40 || peer.usages[0].Size != 1000 {
+		t.Fatalf("compat usage updates = %#v", peer.usages)
+	}
+	if session.pendingTokenUsage != nil {
+		t.Fatalf("pending usage should be empty, got %#v", session.pendingTokenUsage)
+	}
+}
+
+func TestAppServerTokenUsageIgnoresMismatchedTurnID(t *testing.T) {
+	peer := &fakePeer{}
+	session := &appServerSession{
+		sessionID:              "sess_test",
+		threadID:               "thread_1",
+		activeTurnID:           "turn_active",
+		currentModel:           "gpt-5.4",
+		currentReasoningEffort: "medium",
+		conn:                   peer,
+	}
+
+	session.handleNotification("thread/tokenUsage/updated", []byte(`{
+		"threadId":"thread_1",
+		"turnId":"turn_other",
+		"tokenUsage":{
+			"last":{"totalTokens":10,"inputTokens":8,"cachedInputTokens":2,"outputTokens":2,"reasoningOutputTokens":1},
+			"modelContextWindow":100
+		}
+	}`))
+	session.finishTurn("turn_active", appTurnResult{stop: acp.StopReasonEndTurn})
+
+	if len(peer.thoughtMetas) != 0 {
+		t.Fatalf("mismatched turn usage should not flush, got %#v", peer.thoughtMetas)
+	}
+	if len(peer.usages) != 0 {
+		t.Fatalf("mismatched turn usage should not send compat updates, got %#v", peer.usages)
+	}
+	if session.pendingTokenUsage != nil {
+		t.Fatalf("pending usage should remain empty, got %#v", session.pendingTokenUsage)
+	}
+}
+
 func TestAppServerPlanItemDeltaMapsToInternalPlanningEvents(t *testing.T) {
 	peer := &fakePeer{}
 	session := &appServerSession{sessionID: "sess_test", conn: peer}

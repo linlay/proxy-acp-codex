@@ -49,6 +49,7 @@ type appServerSession struct {
 	completedOnStart   map[string]bool
 	seenPlanStarted    map[string]bool
 	seenPlanDelta      map[string]bool
+	pendingTokenUsage  *appServerUsageSnapshot
 	closed             bool
 }
 
@@ -62,6 +63,34 @@ type appServerCollaborationMode struct {
 	Mode            string  `json:"mode"`
 	Model           *string `json:"model"`
 	ReasoningEffort *string `json:"reasoning_effort"`
+}
+
+type appServerTokenUsageNotification struct {
+	ThreadID   string                    `json:"threadId"`
+	TurnID     string                    `json:"turnId"`
+	TokenUsage appServerThreadTokenUsage `json:"tokenUsage"`
+}
+
+type appServerThreadTokenUsage struct {
+	Total              appServerTokenUsageBreakdown `json:"total"`
+	Last               appServerTokenUsageBreakdown `json:"last"`
+	ModelContextWindow *int                         `json:"modelContextWindow"`
+}
+
+type appServerTokenUsageBreakdown struct {
+	TotalTokens           int `json:"totalTokens"`
+	InputTokens           int `json:"inputTokens"`
+	CachedInputTokens     int `json:"cachedInputTokens"`
+	OutputTokens          int `json:"outputTokens"`
+	ReasoningOutputTokens int `json:"reasoningOutputTokens"`
+}
+
+type appServerUsageSnapshot struct {
+	TurnID             string
+	ModelKey           string
+	ReasoningEffort    string
+	ModelContextWindow int
+	Last               appServerTokenUsageBreakdown
 }
 
 func startAppServerSession(ctx context.Context, codexCommand string, appArgs []string, options codexRuntimeOptions, cwd string, sessionID acp.SessionId, conn acpPeer) (*appServerSession, error) {
@@ -218,6 +247,7 @@ func (s *appServerSession) prompt(ctx context.Context, text string, planningMode
 	s.messagePhases = map[string]string{}
 	s.seenPlanStarted = map[string]bool{}
 	s.seenPlanDelta = map[string]bool{}
+	s.pendingTokenUsage = nil
 	s.mu.Unlock()
 
 	var response struct {
@@ -244,6 +274,7 @@ func (s *appServerSession) prompt(ctx context.Context, text string, planningMode
 		s.setActiveTurnID(response.Turn.ID)
 	}
 	if result, ok := resultFromTurn(response.Turn); ok {
+		s.flushPendingTokenUsage(response.Turn.ID)
 		s.clearTurn(done)
 		return result.stop, result.err
 	}
@@ -643,24 +674,188 @@ func (s *appServerSession) hasPlanningDelta(planningID string) bool {
 }
 
 func (s *appServerSession) handleTokenUsageUpdated(params json.RawMessage) {
-	var payload struct {
-		TokenUsage struct {
-			Last struct {
-				TotalTokens int `json:"totalTokens"`
-			} `json:"last"`
-			ModelContextWindow int `json:"modelContextWindow"`
-		} `json:"tokenUsage"`
-	}
+	var payload appServerTokenUsageNotification
 	if json.Unmarshal(params, &payload) != nil {
 		return
 	}
-	if payload.TokenUsage.Last.TotalTokens <= 0 || payload.TokenUsage.ModelContextWindow <= 0 {
+	if payload.TokenUsage.Last.TotalTokens <= 0 &&
+		payload.TokenUsage.Last.InputTokens <= 0 &&
+		payload.TokenUsage.Last.OutputTokens <= 0 {
 		return
 	}
-	s.sendUpdate(acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
-		Used: payload.TokenUsage.Last.TotalTokens,
-		Size: payload.TokenUsage.ModelContextWindow,
-	}})
+
+	modelContextWindow := 0
+	if payload.TokenUsage.ModelContextWindow != nil {
+		modelContextWindow = *payload.TokenUsage.ModelContextWindow
+	}
+
+	s.mu.Lock()
+	if s.threadID != "" && strings.TrimSpace(payload.ThreadID) != "" && strings.TrimSpace(payload.ThreadID) != s.threadID {
+		s.mu.Unlock()
+		return
+	}
+	turnID := strings.TrimSpace(payload.TurnID)
+	if turnID == "" {
+		turnID = s.activeTurnID
+	}
+	if turnID == "" {
+		s.mu.Unlock()
+		if modelContextWindow > 0 {
+			s.sendUpdate(acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+				Used: appServerUsageCurrentSize(payload.TokenUsage.Last),
+				Size: modelContextWindow,
+			}})
+		}
+		return
+	}
+	if s.activeTurnID != "" && turnID != "" && turnID != s.activeTurnID {
+		s.mu.Unlock()
+		return
+	}
+	s.pendingTokenUsage = &appServerUsageSnapshot{
+		TurnID:             turnID,
+		ModelKey:           firstNonBlank(s.currentModel, s.options.model),
+		ReasoningEffort:    firstNonBlank(s.currentReasoningEffort, s.options.reasoningEffort),
+		ModelContextWindow: modelContextWindow,
+		Last:               payload.TokenUsage.Last,
+	}
+	s.mu.Unlock()
+
+	if modelContextWindow > 0 {
+		s.sendUpdate(acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+			Used: appServerUsageCurrentSize(payload.TokenUsage.Last),
+			Size: modelContextWindow,
+		}})
+	}
+}
+
+func (s *appServerSession) flushPendingTokenUsage(turnID string) {
+	usage := s.takePendingTokenUsage(turnID)
+	if usage == nil {
+		return
+	}
+	s.sendUsageSnapshot(*usage)
+}
+
+func (s *appServerSession) takePendingTokenUsage(turnID string) *appServerUsageSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.takePendingTokenUsageLocked(turnID)
+}
+
+func (s *appServerSession) takePendingTokenUsageLocked(turnID string) *appServerUsageSnapshot {
+	if s.pendingTokenUsage == nil {
+		return nil
+	}
+	wantTurnID := strings.TrimSpace(turnID)
+	gotTurnID := strings.TrimSpace(s.pendingTokenUsage.TurnID)
+	if wantTurnID != "" && gotTurnID != "" && wantTurnID != gotTurnID {
+		return nil
+	}
+	usage := s.pendingTokenUsage
+	s.pendingTokenUsage = nil
+	return usage
+}
+
+func (s *appServerSession) sendUsageSnapshot(usage appServerUsageSnapshot) {
+	payload := usage.platformPayload()
+	if len(payload) == 0 {
+		return
+	}
+	s.sendUpdate(acp.SessionUpdate{
+		AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content:       acp.TextBlock(""),
+			SessionUpdate: "agent_thought_chunk",
+			Meta: map[string]any{
+				platform.ACPMetaEventType:     "usage.snapshot",
+				platform.ACPMetaUsageSnapshot: payload,
+			},
+		},
+	})
+}
+
+func (u appServerUsageSnapshot) platformPayload() map[string]any {
+	current := appServerUsageStatsMap(u.Last)
+	if len(current) == 0 {
+		return nil
+	}
+	if modelKey := strings.TrimSpace(u.ModelKey); modelKey != "" {
+		current["modelKey"] = modelKey
+	}
+	if effort := strings.TrimSpace(u.ReasoningEffort); effort != "" {
+		current["reasoningEffort"] = effort
+	}
+	current["llmChatCompletionCount"] = 1
+
+	contextWindow := map[string]any{}
+	if u.ModelContextWindow > 0 {
+		contextWindow["maxSize"] = u.ModelContextWindow
+	}
+	if currentSize := appServerUsageCurrentSize(u.Last); currentSize > 0 {
+		contextWindow["currentSize"] = currentSize
+	}
+	if modelKey := strings.TrimSpace(u.ModelKey); modelKey != "" {
+		contextWindow["modelKey"] = modelKey
+	}
+	if effort := strings.TrimSpace(u.ReasoningEffort); effort != "" {
+		contextWindow["reasoningEffort"] = effort
+	}
+
+	payload := map[string]any{
+		"usage": map[string]any{
+			"current": current,
+		},
+	}
+	if len(contextWindow) > 0 {
+		payload["contextWindow"] = contextWindow
+	}
+	if modelKey := strings.TrimSpace(u.ModelKey); modelKey != "" {
+		payload["model"] = map[string]any{"key": modelKey}
+	}
+	return payload
+}
+
+func appServerUsageStatsMap(usage appServerTokenUsageBreakdown) map[string]any {
+	totalTokens := usage.TotalTokens
+	if totalTokens <= 0 {
+		totalTokens = usage.InputTokens + usage.OutputTokens
+	}
+	if totalTokens <= 0 && usage.InputTokens <= 0 && usage.OutputTokens <= 0 {
+		return nil
+	}
+	out := map[string]any{
+		"promptTokens":     maxInt(usage.InputTokens, 0),
+		"completionTokens": maxInt(usage.OutputTokens, 0),
+		"totalTokens":      maxInt(totalTokens, 0),
+	}
+	cacheHitTokens := maxInt(usage.CachedInputTokens, 0)
+	cacheMissTokens := maxInt(usage.InputTokens-cacheHitTokens, 0)
+	if usage.InputTokens > 0 || cacheHitTokens > 0 {
+		out["promptTokensDetails"] = map[string]any{
+			"cacheHitTokens":  cacheHitTokens,
+			"cacheMissTokens": cacheMissTokens,
+		}
+	}
+	if usage.OutputTokens > 0 || usage.ReasoningOutputTokens > 0 {
+		out["completionTokensDetails"] = map[string]any{
+			"reasoningTokens": maxInt(usage.ReasoningOutputTokens, 0),
+		}
+	}
+	return out
+}
+
+func appServerUsageCurrentSize(usage appServerTokenUsageBreakdown) int {
+	if usage.InputTokens > 0 {
+		return usage.InputTokens
+	}
+	return maxInt(usage.TotalTokens, 0)
+}
+
+func maxInt(value int, minimum int) int {
+	if value < minimum {
+		return minimum
+	}
+	return value
 }
 
 func (s *appServerSession) handleServerRequest(method string, params json.RawMessage) (any, error) {
@@ -886,7 +1081,11 @@ func (s *appServerSession) setActiveTurnID(turnID string) {
 func (s *appServerSession) finishTurn(turnID string, result appTurnResult) {
 	s.mu.Lock()
 	if s.turnDone == nil {
+		usage := s.takePendingTokenUsageLocked(turnID)
 		s.mu.Unlock()
+		if usage != nil {
+			s.sendUsageSnapshot(*usage)
+		}
 		return
 	}
 	if s.activeTurnID != "" && turnID != "" && s.activeTurnID != turnID {
@@ -899,8 +1098,12 @@ func (s *appServerSession) finishTurn(turnID string, result appTurnResult) {
 	done := s.turnDone
 	s.turnDone = nil
 	s.activeTurnID = ""
+	usage := s.takePendingTokenUsageLocked(turnID)
 	s.mu.Unlock()
 
+	if usage != nil {
+		s.sendUsageSnapshot(*usage)
+	}
 	select {
 	case done <- result:
 	default:
@@ -912,6 +1115,7 @@ func (s *appServerSession) clearTurn(done chan appTurnResult) {
 	if s.turnDone == done {
 		s.turnDone = nil
 		s.activeTurnID = ""
+		s.pendingTokenUsage = nil
 	}
 	s.mu.Unlock()
 }
