@@ -159,6 +159,9 @@ func TestModelsEndpointUsesCodexDebugModels(t *testing.T) {
 	if strings.Join(first.ServiceTiers, ",") != "FAST" {
 		t.Fatalf("first service tiers = %#v", first.ServiceTiers)
 	}
+	if strings.Join(first.ReasoningEfforts, ",") != "MEDIUM" {
+		t.Fatalf("first reasoning efforts = %#v", first.ReasoningEfforts)
+	}
 	second := decoded.Data.Models[1]
 	if strings.Join(second.ServiceTiers, ",") != "FLEX" {
 		t.Fatalf("second service tiers = %#v", second.ServiceTiers)

@@ -48,12 +48,13 @@ type ModelCatalogResponse struct {
 }
 
 type ModelCatalogItem struct {
-	Key           string   `json:"key"`
-	Name          string   `json:"name,omitempty"`
-	ModelID       string   `json:"modelId,omitempty"`
-	ContextWindow int      `json:"contextWindow,omitempty"`
-	IsReasoner    bool     `json:"isReasoner,omitempty"`
-	ServiceTiers  []string `json:"serviceTiers,omitempty"`
+	Key              string   `json:"key"`
+	Name             string   `json:"name,omitempty"`
+	ModelID          string   `json:"modelId,omitempty"`
+	ContextWindow    int      `json:"contextWindow,omitempty"`
+	IsReasoner       bool     `json:"isReasoner,omitempty"`
+	ReasoningEfforts []string `json:"reasoningEfforts,omitempty"`
+	ServiceTiers     []string `json:"serviceTiers,omitempty"`
 }
 
 type Scene struct {

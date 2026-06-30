@@ -80,12 +80,13 @@ func (s *Server) queryCodexModels(ctx context.Context) (platform.ModelCatalogRes
 			continue
 		}
 		items = append(items, platform.ModelCatalogItem{
-			Key:           strings.TrimSpace(model.Slug),
-			Name:          strings.TrimSpace(model.DisplayName),
-			ModelID:       strings.TrimSpace(model.Slug),
-			ContextWindow: model.ContextWindow,
-			IsReasoner:    len(model.SupportedReasoningLevels) > 0,
-			ServiceTiers:  codexModelServiceTiers(model),
+			Key:              strings.TrimSpace(model.Slug),
+			Name:             strings.TrimSpace(model.DisplayName),
+			ModelID:          strings.TrimSpace(model.Slug),
+			ContextWindow:    model.ContextWindow,
+			IsReasoner:       len(model.SupportedReasoningLevels) > 0,
+			ReasoningEfforts: codexModelReasoningEfforts(model),
+			ServiceTiers:     codexModelServiceTiers(model),
 		})
 	}
 	return platform.ModelCatalogResponse{Models: items}, nil
@@ -146,6 +147,38 @@ func codexModelServiceTiers(model codexDebugModel) []string {
 		appendTier(tier.ID)
 	}
 	return out
+}
+
+func codexModelReasoningEfforts(model codexDebugModel) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(model.SupportedReasoningLevels))
+	for _, level := range model.SupportedReasoningLevels {
+		effort := normalizeCodexModelReasoningEffort(level.Effort)
+		if effort == "" {
+			continue
+		}
+		if _, ok := seen[effort]; ok {
+			continue
+		}
+		seen[effort] = struct{}{}
+		out = append(out, effort)
+	}
+	return out
+}
+
+func normalizeCodexModelReasoningEffort(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low":
+		return "LOW"
+	case "medium":
+		return "MEDIUM"
+	case "high":
+		return "HIGH"
+	case "xhigh", "extra_high", "extra-high":
+		return "XHIGH"
+	default:
+		return ""
+	}
 }
 
 func normalizeCodexModelServiceTier(value string) string {
